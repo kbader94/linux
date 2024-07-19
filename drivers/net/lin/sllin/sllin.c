@@ -38,11 +38,8 @@
  * Authors:    Pavel Pisa <pisa@cmp.felk.cvut.cz>
  *             Rostislav Lisovy <lisovy@kormus.cz>
  *             Michal Sojka <sojkam1@fel.cvut.cz>
- * Funded by:  Volkswagen Group Research
+ *             Kyle Bader <kyle.bader94@gmail.com>
  */
-
-//#define DEBUG			1 /* Enables pr_debug() printouts */
-//#define SLLIN_LED_TRIGGER /* Enables led triggers */
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -64,41 +61,12 @@
 #include <linux/kthread.h>
 #include <linux/hrtimer.h>
 #include <linux/version.h>
-#include "linux/lin_bus.h"
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
 #include <uapi/linux/sched/types.h>
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
-#include <linux/can/can-ml.h>
-#endif
+#include <linux/can/can-ml.h> /* TODO: rm */
 
 #ifndef fallthrough
 #define fallthrough do {} while(0)
 #endif
-
-/* Should be in include/linux/tty.h */
-#define N_SLLIN			28
-#define N_SLLIN_SLAVE		29
-/* -------------------------------- */
-
-#ifdef SLLIN_LED_TRIGGER
-#define SLLIN_LED_NAME_SZ (IFNAMSIZ + 6)
-#include <linux/leds.h>
-
-enum sllin_led_event {
-	SLLIN_LED_EVENT_OPEN,
-	SLLIN_LED_EVENT_STOP,
-	SLLIN_LED_EVENT_TX,
-	SLLIN_LED_EVENT_RX
-};
-
-static unsigned long led_delay = 50;
-module_param(led_delay, ulong, 0644);
-MODULE_PARM_DESC(led_delay,
-                 "blink delay time for activity leds (msecs, default: 50).");
-#endif /* SLLIN_LED_TRIGGER */
 
 static const char banner[] =
 	KERN_INFO "sllin: serial line LIN interface driver\n";
@@ -213,29 +181,15 @@ struct sllin {
 	struct sllin_conf_entry linfr_cache[LIN_ID_MAX + 1];
 	spinlock_t		linfr_lock;	/* frame cache and buffers lock */
 
-#ifdef SLLIN_LED_TRIGGER
-	struct led_trigger *tx_led_trig;
-	char                tx_led_trig_name[SLLIN_LED_NAME_SZ];
-	struct led_trigger *rx_led_trig;
-	char                rx_led_trig_name[SLLIN_LED_NAME_SZ];
-	struct led_trigger *rxtx_led_trig;
-	char                rxtx_led_trig_name[SLLIN_LED_NAME_SZ];
-#endif
 };
 
 static struct net_device **sllin_devs;
 static int sllin_configure_frame_cache(struct sllin *sl, struct can_frame *cf);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 static void sllin_slave_receive_buf(struct tty_struct *tty,
 			      const u8 *cp, const u8 *fp, size_t count);
 static void sllin_master_receive_buf(struct tty_struct *tty,
 			      const u8 *cp, const u8 *fp, size_t count);
-#else
-static void sllin_slave_receive_buf(struct tty_struct *tty,
-			      const unsigned char *cp, const char *fp, int count);
-static void sllin_master_receive_buf(struct tty_struct *tty,
-			      const unsigned char *cp, const char *fp, int count);
-#endif
+
 
 /* Values of two parity bits in LIN Protected
    Identifier for each particular LIN ID */
@@ -249,124 +203,6 @@ const unsigned char sllin_id_parity_table[] = {
 	0xc0, 0x80, 0x00, 0x40, 0x80, 0xc0, 0x40, 0x00,
 	0x40, 0x00, 0x80, 0xc0, 0x00, 0x40, 0xc0, 0x80
 };
-
-#ifdef SLLIN_LED_TRIGGER
-static void sllin_led_event(struct net_device *netdev, enum sllin_led_event event)
-{
-	struct sllin *sl = netdev_priv(netdev);
-
-	switch (event) {
-	case SLLIN_LED_EVENT_OPEN:
-		led_trigger_event(sl->tx_led_trig,   LED_FULL);
-		led_trigger_event(sl->rx_led_trig,   LED_FULL);
-		led_trigger_event(sl->rxtx_led_trig, LED_FULL);
-		break;
-	case SLLIN_LED_EVENT_STOP:
-		led_trigger_event(sl->tx_led_trig,   LED_OFF);
-		led_trigger_event(sl->rx_led_trig,   LED_OFF);
-		led_trigger_event(sl->rxtx_led_trig, LED_OFF);
-		break;
-	case SLLIN_LED_EVENT_TX:
-		if (led_delay) {
-			led_trigger_blink_oneshot(sl->tx_led_trig,
-			                          &led_delay, &led_delay, 1);
-			led_trigger_blink_oneshot(sl->rxtx_led_trig,
-			                          &led_delay, &led_delay, 1);
-		}
-		break;
-	case SLLIN_LED_EVENT_RX:
-		if (led_delay) {
-			led_trigger_blink_oneshot(sl->rx_led_trig,
-			                          &led_delay, &led_delay, 1);
-			led_trigger_blink_oneshot(sl->rxtx_led_trig,
-			                          &led_delay, &led_delay, 1);
-		}
-		break;
-	}
-}
-
-static void sllin_led_release(struct device *gendev, void *res)
-{
-	struct sllin *sl = netdev_priv(to_net_dev(gendev));
-
-	led_trigger_unregister_simple(sl->tx_led_trig);
-	led_trigger_unregister_simple(sl->rx_led_trig);
-	led_trigger_unregister_simple(sl->rxtx_led_trig);
-}
-
-static void devm_sllin_led_init(struct net_device *netdev)
-{
-	struct sllin *sl = netdev_priv(netdev);
-	void *res;
-
-	res = devres_alloc(sllin_led_release, 0, GFP_KERNEL);
-	if (!res) {
-		netdev_err(netdev, "cannot register LED triggers\n");
-		return;
-	}
-
-	snprintf(sl->tx_led_trig_name, sizeof(sl->tx_led_trig_name),
-	         "%s-tx", netdev->name);
-	snprintf(sl->rx_led_trig_name, sizeof(sl->rx_led_trig_name),
-	         "%s-rx", netdev->name);
-	snprintf(sl->rxtx_led_trig_name, sizeof(sl->rxtx_led_trig_name),
-	         "%s-rxtx", netdev->name);
-
-	led_trigger_register_simple(sl->tx_led_trig_name,
-	                            &sl->tx_led_trig);
-	led_trigger_register_simple(sl->rx_led_trig_name,
-	                            &sl->rx_led_trig);
-	led_trigger_register_simple(sl->rxtx_led_trig_name,
-	                            &sl->rxtx_led_trig);
-
-	devres_add(&netdev->dev, res);
-}
-
-static struct sllin *netdev_priv_safe(struct net_device *dev)
-{
-	int i;
-
-	if (sllin_devs == NULL)
-		return NULL;
-
-	for (i = 0; i < maxdev; ++i)
-		if (sllin_devs[i] == dev)
-			return netdev_priv(dev);
-
-	return NULL;
-}
-
-static int sllin_netdev_notifier_call(struct notifier_block *nb, unsigned long msg,
-                              void *ptr)
-{
-	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
-	struct sllin *sl = netdev_priv_safe(netdev);
-	char name[SLLIN_LED_NAME_SZ];
-
-	if (!sl)
-		return NOTIFY_DONE;
-
-	if (!sl->tx_led_trig || !sl->rx_led_trig || !sl->rxtx_led_trig)
-		return NOTIFY_DONE;
-
-	if (msg == NETDEV_CHANGENAME) {
-		snprintf(name, sizeof(name), "%s-tx", netdev->name);
-		led_trigger_rename_static(name, sl->tx_led_trig);
-
-		snprintf(name, sizeof(name), "%s-rx", netdev->name);
-		led_trigger_rename_static(name, sl->rx_led_trig);
-
-		snprintf(name, sizeof(name), "%s-rxtx", netdev->name);
-		led_trigger_rename_static(name, sl->rxtx_led_trig);
-	}
-
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block sllin_netdev_notifier __read_mostly = {
-	.notifier_call = sllin_netdev_notifier_call,
-};
-#endif /* SLLIN_LED_TRIGGER */
 
 /**
  * sltty_change_speed() -- Change baudrate of Serial device belonging
@@ -382,18 +218,8 @@ static int sltty_change_speed(struct tty_struct *tty, unsigned speed)
 	struct ktermios old_termios, termios;
 	int cflag;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 12, 0)
-	mutex_lock(&tty->termios_mutex);
-#else
 	down_write(&tty->termios_rwsem);
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
-	old_termios = termios = *(tty->termios);
-#else
 	old_termios = termios = tty->termios;
-#endif
-
 	cflag = CS8 | CREAD | CLOCAL | HUPCL;
 	cflag &= ~(CBAUD | CIBAUD);
 	cflag |= BOTHER;
@@ -403,22 +229,14 @@ static int sltty_change_speed(struct tty_struct *tty, unsigned speed)
 
 	/* Enable interrupt when UART-Break or Framing error received */
 	termios.c_iflag = BRKINT | INPCK;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 7, 0)
-	*(tty->termios) = termios;
-#else
 	tty->termios = termios;
-#endif
 
 	tty_encode_baud_rate(tty, speed, speed);
 
 	if (tty->ops->set_termios)
 		tty->ops->set_termios(tty, &old_termios);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 12, 0)
-	mutex_unlock(&tty->termios_mutex);
-#else
 	up_write(&tty->termios_rwsem);
-#endif
 
 	return 0;
 }

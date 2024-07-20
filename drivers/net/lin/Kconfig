@@ -1,0 +1,14 @@
+menuconfig LIN
+    tristate "LIN subsystem support"
+    depends on NET
+    ---help---
+      LIN (Local Interconnect Network) is a low-cost, serial communication
+      protocol used mainly in automotive applications.
+
+if LIN
+
+source "drivers/net/lin/sllin/Kconfig"
+# source "drivers/net/lin/usb/Kconfig"
+# source "drivers/net/lin/spi/Kconfig"
+
+endif # LIN

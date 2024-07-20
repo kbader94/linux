@@ -38,7 +38,8 @@
  * Authors:    Pavel Pisa <pisa@cmp.felk.cvut.cz>
  *             Rostislav Lisovy <lisovy@kormus.cz>
  *             Michal Sojka <sojkam1@fel.cvut.cz>
- *             Kyle Bader <kyle.bader94@gmail.com>
+ * 
+ * 
  */
 
 #include <linux/module.h>
@@ -87,6 +88,31 @@ static bool break_by_baud = false;
 static bool break_by_baud = true;
 #endif /*BREAK_BY_BAUD*/
 
+/* TODO: change these params to ioctl */
+/* Default configuration options from Kconfig */
+#ifdef CONFIG_SLLIN_BAUDRATE
+#define SLLIN_DEFAULT_BAUDRATE CONFIG_SLLIN_BAUDRATE
+#else
+#define SLLIN_DEFAULT_BAUDRATE 19200
+#endif
+
+#ifdef CONFIG_SLLIN_MASTER
+#define SLLIN_DEFAULT_MASTER CONFIG_SLLIN_MASTER
+#else
+#define SLLIN_DEFAULT_MASTER 1
+#endif
+
+#ifdef CONFIG_SLLIN_BREAK_BY_BAUD
+#define SLLIN_DEFAULT_BREAK_BY_BAUD CONFIG_SLLIN_BREAK_BY_BAUD
+#else
+#define SLLIN_DEFAULT_BREAK_BY_BAUD 0
+#endif
+
+static bool master = SLLIN_DEFAULT_MASTER;
+static int baudrate = SLLIN_DEFAULT_BAUDRATE;
+static bool break_by_baud = SLLIN_DEFAULT_BREAK_BY_BAUD;
+
+/* Module parameters */
 module_param(master, bool, 0444);
 MODULE_PARM_DESC(master, "LIN interface is Master device");
 module_param(baudrate, int, 0444);
@@ -94,6 +120,7 @@ MODULE_PARM_DESC(baudrate, "Baudrate of LIN interface");
 module_param(break_by_baud, bool, 0444);
 MODULE_PARM_DESC(break_by_baud, "Break is sent by temporal baudrate switching");
 
+/* FIXME: maxdev is overriden max 4 in a sanity check. */
 static int maxdev = 10;		/* MAX number of SLLIN channels;
 				   This can be overridden with
 				   insmod sllin.ko maxdev=nnn	*/
@@ -263,19 +290,11 @@ static void sllin_send_canfr(struct sllin *sl, canid_t id, char *data, int len)
 	memcpy(skb_put(skb, sizeof(struct can_frame)),
 	       &cf, sizeof(struct can_frame));
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-	if (!in_interrupt())
-		netif_rx_ni(skb);
-	else
-#endif
-		netif_rx(skb);
+	netif_rx(skb);
 
 	sl->dev->stats.rx_packets++;
 	sl->dev->stats.rx_bytes += cf.can_dlc;
 
-#ifdef SLLIN_LED_TRIGGER
-	sllin_led_event(sl->dev, SLLIN_LED_EVENT_RX);
-#endif
 }
 
 /**
@@ -320,11 +339,8 @@ static void sllin_write_wakeup(struct tty_struct *tty)
 
 		clear_bit(SLF_TXBUFF_RQ, &sl->flags);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
-		smp_mb__after_clear_bit();
-#else
 		smp_mb__after_atomic();
-#endif
+
 
 		if (sl->lin_state != SLSTATE_BREAK_SENT)
 			remains = sl->tx_lim - sl->tx_cnt;
@@ -338,11 +354,7 @@ static void sllin_write_wakeup(struct tty_struct *tty)
 			remains -= actual;
 		}
 		clear_bit(SLF_TXBUFF_INPR, &sl->flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
-		smp_mb__after_clear_bit();
-#else
 		smp_mb__after_atomic();
-#endif
 
 	} while (unlikely(test_bit(SLF_TXBUFF_RQ, &sl->flags)));
 
@@ -425,9 +437,6 @@ static int sll_close(struct net_device *dev)
 	sl->tx_lim    = 0;
 	spin_unlock_bh(&sl->lock);
 
-#ifdef SLLIN_LED_TRIGGER
-	sllin_led_event(dev, SLLIN_LED_EVENT_STOP);
-#endif
 	return 0;
 }
 
@@ -444,9 +453,6 @@ static int sll_open(struct net_device *dev)
 	sl->flags &= (1 << SLF_INUSE);
 	netif_start_queue(dev);
 
-#ifdef SLLIN_LED_TRIGGER
-	sllin_led_event(dev, SLLIN_LED_EVENT_OPEN);
-#endif
 	return 0;
 }
 
@@ -454,9 +460,6 @@ static int sll_open(struct net_device *dev)
 static void sll_free_netdev(struct net_device *dev)
 {
 	int i = dev->base_addr;
-	#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 9)
-		free_netdev(dev);
-	#endif
 	sllin_devs[i] = NULL;
 }
 
@@ -469,12 +472,8 @@ static const struct net_device_ops sll_netdev_ops = {
 static void sll_setup(struct net_device *dev)
 {
 	dev->netdev_ops		= &sll_netdev_ops;
-	#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 9)
-		dev->destructor		= sll_free_netdev;
-	#else /* Linux 4.11.9+ */
-		dev->needs_free_netdev	= true;
-		dev->priv_destructor	= sll_free_netdev;
-	#endif /* Linux 4.11.9+ */
+	dev->needs_free_netdev	= true;
+	dev->priv_destructor	= sll_free_netdev;
 
 	dev->hard_header_len	= 0;
 	dev->addr_len		= 0;
@@ -491,13 +490,8 @@ static void sll_setup(struct net_device *dev)
 /******************************************
   Routines looking at TTY side.
  ******************************************/
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 static void sllin_master_receive_buf(struct tty_struct *tty,
 			      const u8 *cp, const u8 *fp, size_t count)
-#else
-static void sllin_master_receive_buf(struct tty_struct *tty,
-			      const unsigned char *cp, const char *fp, int count)
-#endif
 {
 	struct sllin *sl = (struct sllin *) tty->disc_data;
 
@@ -739,18 +733,13 @@ static void sllin_slave_finish_rx_msg(struct sllin *sl)
 	sl->rx_len_unknown = false; /* We do know exact length of the header */
 	sl->header_received = false;
 }
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+
 static void sllin_slave_receive_buf(struct tty_struct *tty,
 			      const u8 *cp, const u8 *fp, size_t count)
-#else
-static void sllin_slave_receive_buf(struct tty_struct *tty,
-			      const unsigned char *cp, const char *fp, int count)
-#endif
 {
 	struct sllin *sl = (struct sllin *) tty->disc_data;
 	int lin_id;
 	struct sllin_conf_entry *sce;
-
 
 	/* Read the characters out of the buffer */
 	while (count--) {
@@ -851,19 +840,11 @@ static void sllin_slave_receive_buf(struct tty_struct *tty,
 	}
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
-#define sllin_receive_buf_fp_const const
-#else
-#define sllin_receive_buf_fp_const
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define sllin_receive_buf_fp_const const
+
 static void sllin_receive_buf(struct tty_struct *tty, const u8 *cp,
                               const u8 *fp, size_t count)
-#else
-static void sllin_receive_buf(struct tty_struct *tty, const unsigned char *cp,
-                              sllin_receive_buf_fp_const char *fp, int count)
-#endif
 {
 	struct sllin *sl = (struct sllin *) tty->disc_data;
 	netdev_dbg(sl->dev, "sllin_receive_buf invoked, count = %lu\n", (unsigned long)count);
@@ -889,11 +870,7 @@ static int sllin_send_tx_buff(struct sllin *sl)
 			return 0;	/* ongoing concurrent processing */
 
 		clear_bit(SLF_TXBUFF_RQ, &sl->flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
-		smp_mb__after_clear_bit();
-#else
 		smp_mb__after_atomic();
-#endif
 
 		if (sl->lin_break_by_baud) {
 			if (sl->lin_state != SLSTATE_BREAK_SENT)
@@ -927,17 +904,9 @@ static int sllin_send_tx_buff(struct sllin *sl)
 				sl->tx_cnt, remains);
 
 		clear_bit(SLF_TXBUFF_INPR, &sl->flags);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
-		smp_mb__after_clear_bit();
-#else
 		smp_mb__after_atomic();
-#endif
 
 	} while (unlikely(test_bit(SLF_TXBUFF_RQ, &sl->flags)));
-
-#ifdef SLLIN_LED_TRIGGER
-	sllin_led_event(sl->dev, SLLIN_LED_EVENT_TX);
-#endif
 
 	return 0;
 
@@ -1065,12 +1034,7 @@ static int sllin_kwthread(void *ptr)
 	int lin_id;
 	struct sllin_conf_entry *sce;
 
-	#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-		struct sched_param schparam = { .sched_priority = 40 };
-		sched_setscheduler(current, SCHED_FIFO, &schparam);
-	#else /* >= KERNEL_VERSION(5, 9, 0) */
-		sched_set_fifo(current);
-	#endif
+	sched_set_fifo(current);
 
 	netdev_dbg(sl->dev, "sllin_kwthread started.\n");
 
@@ -1405,10 +1369,8 @@ static void sll_sync(void)
 static struct sllin *sll_alloc(dev_t line)
 {
 	int i;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 	int size;
 	struct can_ml_priv *can_ml;
-#endif
 	struct net_device *dev = NULL;
 	struct sllin       *sl;
 
@@ -1438,14 +1400,9 @@ static struct sllin *sll_alloc(dev_t line)
 	if (!dev) {
 		char name[IFNAMSIZ];
 		sprintf(name, "sllin%d", i);
-		#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
-			size = ALIGN(sizeof(*sl), NETDEV_ALIGN) + sizeof(struct can_ml_priv);
-			dev = alloc_netdev(size, name, NET_NAME_UNKNOWN, sll_setup);
-		#elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-			dev = alloc_netdev(sizeof(*sl), name, sll_setup);
-		#else
-			dev = alloc_netdev(sizeof(*sl), name, NET_NAME_UNKNOWN, sll_setup);
-		#endif
+
+		size = ALIGN(sizeof(*sl), NETDEV_ALIGN) + sizeof(struct can_ml_priv);
+		dev = alloc_netdev(size, name, NET_NAME_UNKNOWN, sll_setup);
 
 		if (!dev)
 			return NULL;
@@ -1453,10 +1410,10 @@ static struct sllin *sll_alloc(dev_t line)
 	}
 
 	sl = netdev_priv(dev);
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
-		can_ml = (void *)sl + ALIGN(sizeof(*sl), NETDEV_ALIGN);
-		can_set_ml_priv(dev, can_ml);
-	#endif
+
+	can_ml = (void *)sl + ALIGN(sizeof(*sl), NETDEV_ALIGN);
+	can_set_ml_priv(dev, can_ml);
+
 	/* Initialize channel control data */
 	sl->magic = SLLIN_MAGIC;
 	sl->dev	= dev;
@@ -1556,9 +1513,6 @@ static int sllin_open_common(struct tty_struct *tty, bool setup_master)
 		if (sl->kwthread == NULL)
 			goto err_free_chan_and_netdev;
 
-#ifdef SLLIN_LED_TRIGGER
-		devm_sllin_led_init(sl->dev);
-#endif
 	}
 
 	/* Done.  We have linked the TTY line to a channel. */
@@ -1648,27 +1602,14 @@ static void sllin_close(struct tty_struct *tty)
 	/* This will complete via sl_free_netdev */
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-static int sllin_hangup(struct tty_struct *tty)
-{
-	sllin_close(tty);
-	return 0;
-}
-#else /* >= 5.17.0 */
 static void sllin_hangup(struct tty_struct *tty)
 {
 	sllin_close(tty);
 }
-#endif
 
 /* Perform I/O control on an active SLLIN channel. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-static int sllin_ioctl(struct tty_struct *tty, struct file *file,
-		       unsigned int cmd, unsigned long arg)
-#else /* >= 5.16.0 */
 static int sllin_ioctl(struct tty_struct *tty,
 		       unsigned int cmd, unsigned long arg)
-#endif
 {
 	struct sllin *sl = (struct sllin *) tty->disc_data;
 	unsigned int tmp;
@@ -1677,31 +1618,27 @@ static int sllin_ioctl(struct tty_struct *tty,
 	if (!sl || sl->magic != SLLIN_MAGIC)
 		return -EINVAL;
 
+	/* TODO: implement new ioctl for LIN break detection and/or setting UART rx fifo buffer size*/
 	switch (cmd) {
-	case SIOCGIFNAME:
-		tmp = strlen(sl->dev->name) + 1;
-		if (copy_to_user((void __user *)arg, sl->dev->name, tmp))
-			return -EFAULT;
-		return 0;
+		case SIOCGIFNAME:
+			tmp = strlen(sl->dev->name) + 1;
+			if (copy_to_user((void __user *)arg, sl->dev->name, tmp))
+				return -EFAULT;
+			return 0;
 
-	case SIOCSIFHWADDR:
-		return -EINVAL;
+		case SIOCSIFHWADDR:
+			return -EINVAL;
 
-	default:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)
-		return tty_mode_ioctl(tty, file, cmd, arg);
-#else /* >= 5.16.0 */
-		return tty_mode_ioctl(tty, cmd, arg);
-#endif
+		default:
+
+			return tty_mode_ioctl(tty, cmd, arg);
+
 	}
 }
 
 static struct tty_ldisc_ops sll_ldisc = {
 	.owner		= THIS_MODULE,
 	.num		= N_SLLIN,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0)
-	.magic		= TTY_LDISC_MAGIC,
-#endif
 	.name		= "sllin",
 	.open		= sllin_open,
 	.close		= sllin_close,
@@ -1714,9 +1651,6 @@ static struct tty_ldisc_ops sll_ldisc = {
 static struct tty_ldisc_ops sll_slave_ldisc = {
 	.owner		= THIS_MODULE,
 	.num		= N_SLLIN_SLAVE,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 13, 0)
-	.magic		= TTY_LDISC_MAGIC,
-#endif
 	.name		= "sllin-slave",
 	.open		= sllin_open_slave,
 	.close		= sllin_close,
@@ -1728,32 +1662,18 @@ static struct tty_ldisc_ops sll_slave_ldisc = {
 
 static int sllin_register_ldisc(struct tty_ldisc_ops *new_ldisc)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
 	return tty_register_ldisc(new_ldisc);
-#else /* < 5.14.0 */
-	return tty_register_ldisc(new_ldisc->num, new_ldisc);
-#endif /* < 5.14.0 */
 }
 
 static int sllin_unregister_ldisc(struct tty_ldisc_ops *ldisc)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
 	tty_unregister_ldisc(ldisc);
 	return 0;
-#else /* < 5.14.0 */
-	return tty_unregister_ldisc(ldisc->num);
-#endif /* < 5.14.0 */
 }
 
 static int __init sllin_init(void)
 {
 	int status;
-
-#ifdef SLLIN_LED_TRIGGER
-	status = register_netdevice_notifier(&sllin_netdev_notifier);
-	if (status)
-		pr_err("sllin: can't register netdevice notifier\n");
-#endif
 
 	if (maxdev < 4)
 		maxdev = 4; /* Sanity */
@@ -1821,7 +1741,7 @@ static void __exit sllin_exit(void)
 			spin_unlock_bh(&sl->lock);
 		}
 	} while (busy && time_before(jiffies, timeout));
-
+	while(sl->tty)
 	/* FIXME: hangup is async so we should wait when doing this second
 	   phase */
 
@@ -1835,11 +1755,8 @@ static void __exit sllin_exit(void)
 		if (sl->tty) {
 			netdev_dbg(sl->dev, "tty discipline still running\n");
 			/* Intentionally leak the control block. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 9)
-			dev->destructor = NULL;
-#else /* Linux 4.11.9+ */
 			dev->priv_destructor = NULL;
-#endif /* Linux 4.11.9+ */
+
 		}
 
 		unregister_netdev(dev);
@@ -1855,11 +1772,6 @@ static void __exit sllin_exit(void)
 	i = sllin_unregister_ldisc(&sll_slave_ldisc);
 	if (i)
 		pr_err("sllin: can't unregister slave ldisc (err %d)\n", i);
-
-
-#ifdef SLLIN_LED_TRIGGER
-	unregister_netdevice_notifier(&sllin_netdev_notifier);
-#endif
 
 }
 

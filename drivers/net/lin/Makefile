@@ -3,14 +3,11 @@
 #  Makefile for the Linux Local Interconnect Network drivers.
 #
 
-obj-$(CONFIG_LIN_SLLIN)		+= slcan/
+obj-$(CONFIG_LIN_SLLIN)		+= sllin/
 #TODO: vlin.o
 
-obj-y				+= dev/
-obj-y				+= esd/
-obj-y				+= rcar/
-obj-y				+= spi/
-obj-y				+= usb/
-obj-y				+= softing/
+# obj-y				+= dev/
+# obj-y				+= spi/
+# obj-y				+= usb/
 
 subdir-ccflags-$(CONFIG_LIN_DEBUG_DEVICES) += -DDEBUG

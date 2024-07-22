@@ -3,11 +3,10 @@
 menuconfig LIN_DEV
 	tristate "LIN Device Drivers"
 	default y
-	depends on NET
+	depends on NET # LIN
 	help
 	  Local Interconnect Network (LIN) is a serial communication protocol used
-	  for communication between components in vehicles. It is designed to be 
-	  simpler and cheaper than CAN.
+	  for communication between components in vehicles. 
 
 	  This section contains all the LIN device drivers. If you own such devices 
 	  or plan to use LIN interfaces to develop applications, say Y here.

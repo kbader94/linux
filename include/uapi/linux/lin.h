@@ -54,6 +54,22 @@
 #include <linux/stddef.h> /* for offsetof */
 
 /* Local Interconnect Network (LIN) kernel definitions */
+#define LIN_ID_MASK		0x3f
+#define LIN_ID_MAX		LIN_ID_MASK
+#define LIN_CTRL_FRAME 		CAN_EFF_FLAG
+
+#define LIN_DEFAULT_BAUDRATE	19200
+
+#define LIN_CANFR_FLAGS_OFFS	6 /* Lower 6 bits in can_id correspond to LIN ID */
+
+#define LIN_CACHE_RESPONSE	(1 << (LIN_CANFR_FLAGS_OFFS))
+#define LIN_CHECKSUM_EXTENDED	(1 << (LIN_CANFR_FLAGS_OFFS + 1))
+#define LIN_SINGLE_RESPONSE (1 << (LIN_CANFR_FLAGS_OFFS + 2))
+
+/* Error flags */
+#define LIN_ERR_RX_TIMEOUT	(1 << (LIN_CANFR_FLAGS_OFFS + 8))
+#define LIN_ERR_CHECKSUM	(1 << (LIN_CANFR_FLAGS_OFFS + 9))
+#define LIN_ERR_FRAMING		(1 << (LIN_CANFR_FLAGS_OFFS + 10))
 
 /* LIN frame identifier */
 typedef __u8 lin_pid_t;
@@ -116,8 +132,8 @@ struct sockaddr_lin {
  * filter for error message frames.
  */
 struct lin_filter {
-	linid_t lin_id;
-	linid_t lin_mask;
+	lin_pid_t lin_id;
+	lin_pid_t lin_mask;
 };
 
 #define LIN_INV_FILTER 0x80U /*  to be set in lin_filter.lin_id */

@@ -548,6 +548,8 @@ source "drivers/net/pse-pd/Kconfig"
 
 source "drivers/net/can/Kconfig"
 
+source "drivers/net/lin/Kconfig"
+
 source "drivers/net/mctp/Kconfig"
 
 source "drivers/net/mdio/Kconfig"

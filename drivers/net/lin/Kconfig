@@ -1,14 +1,36 @@
-menuconfig LIN
-    tristate "LIN subsystem support"
-    depends on NET
-    ---help---
-      LIN (Local Interconnect Network) is a low-cost, serial communication
-      protocol used mainly in automotive applications.
+# SPDX-License-Identifier: GPL-2.0-only
 
-if LIN
+menuconfig LIN_DEV
+	tristate "LIN Device Drivers"
+	default y
+	depends on NET
+	help
+	  Local Interconnect Network (LIN) is a serial communication protocol used
+	  for communication between components in vehicles. It is designed to be 
+	  simpler and cheaper than CAN.
 
-source "drivers/net/lin/sllin/Kconfig"
-# source "drivers/net/lin/usb/Kconfig"
-# source "drivers/net/lin/spi/Kconfig"
+	  This section contains all the LIN device drivers. If you own such devices 
+	  or plan to use LIN interfaces to develop applications, say Y here.
 
-endif # LIN
+	  To compile as a module, choose M here: the module will be called lin-dev.
+
+if LIN_DEV
+
+config LIN_SLLIN
+	tristate "Serial Line LIN (SLLIN) support"
+	depends on TTY
+	help
+	  Say Y here if you want to use a serial line as a LIN interface.
+	  This driver is similar to the SLCAN driver but for LIN.
+
+	  To compile as a module, choose M here: the module will be called sllin.
+
+config LIN_DEBUG_DEVICES
+	bool "LIN devices debugging messages"
+	help
+	  Say Y here if you want the LIN device drivers to produce a bunch of
+	  debug messages to the system log.  Select this if you are having
+	  a problem with LIN support and want to see more of what is going
+	  on.
+
+endif # LIN_DEV

@@ -59,6 +59,7 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/can.h>
+#include <linux/lin.h>
 #include <linux/kthread.h>
 #include <linux/hrtimer.h>
 #include <linux/version.h>
@@ -78,18 +79,8 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Pavel Pisa <pisa@cmp.felk.cvut.cz>");
 
 #define SLLIN_MAGIC		0x53CA
-/* #define BREAK_BY_BAUD */
 
-static bool master = true;
-static int baudrate; /* Use LIN_DEFAULT_BAUDRATE when not set */
-#ifndef BREAK_BY_BAUD
-static bool break_by_baud = false;
-#else /*BREAK_BY_BAUD*/
-static bool break_by_baud = true;
-#endif /*BREAK_BY_BAUD*/
-
-/* TODO: change these params to ioctl */
-/* Default configuration options from Kconfig */
+/* Default kernel configuration options from Kconfig */
 #ifdef CONFIG_SLLIN_BAUDRATE
 #define SLLIN_DEFAULT_BAUDRATE CONFIG_SLLIN_BAUDRATE
 #else
@@ -120,7 +111,7 @@ MODULE_PARM_DESC(baudrate, "Baudrate of LIN interface");
 module_param(break_by_baud, bool, 0444);
 MODULE_PARM_DESC(break_by_baud, "Break is sent by temporal baudrate switching");
 
-/* FIXME: maxdev is overriden max 4 in a sanity check. */
+/* FIXME: maxdev is overriden max 4 during subsequent sanity checks. */
 static int maxdev = 10;		/* MAX number of SLLIN channels;
 				   This can be overridden with
 				   insmod sllin.ko maxdev=nnn	*/

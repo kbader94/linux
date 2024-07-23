@@ -80,6 +80,9 @@ MODULE_AUTHOR("Pavel Pisa <pisa@cmp.felk.cvut.cz>");
 
 #define SLLIN_MAGIC		0x53CA
 
+#define N_SLLIN		31  /* LIN master serial adapter  */
+#define N_SLLIN_SLAVE   32  /* LIN slave serial adapter */
+
 /* Default kernel configuration options from Kconfig */
 #ifdef CONFIG_SLLIN_BAUDRATE
 #define SLLIN_DEFAULT_BAUDRATE CONFIG_SLLIN_BAUDRATE
@@ -1681,13 +1684,13 @@ static int __init sllin_init(void)
 	/* Fill in our line protocol discipline, and register it */
 	status = sllin_register_ldisc(&sll_ldisc);
 	if (status)  {
-		pr_err("sllin: can't register line discipline\n");
+		pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN, sll_ldisc.name, ret);
 		kfree(sllin_devs);
 	} else {
 		status = sllin_register_ldisc(&sll_slave_ldisc);
 		if (status)  {
 			sllin_unregister_ldisc(&sll_ldisc);
-			pr_err("sllin: can't register slave line discipline\n");
+			pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN_SLAVE, sll_slave_ldisc.name, ret);
 			kfree(sllin_devs);
 		}
 	}

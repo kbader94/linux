@@ -1684,13 +1684,13 @@ static int __init sllin_init(void)
 	/* Fill in our line protocol discipline, and register it */
 	status = sllin_register_ldisc(&sll_ldisc);
 	if (status)  {
-		pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN, sll_ldisc.name, ret);
+		pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN, sll_ldisc.name, status);
 		kfree(sllin_devs);
 	} else {
 		status = sllin_register_ldisc(&sll_slave_ldisc);
 		if (status)  {
 			sllin_unregister_ldisc(&sll_ldisc);
-			pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN_SLAVE, sll_slave_ldisc.name, ret);
+			pr_err("sllin: can't register line discipline %d (%s): %d\n", N_SLLIN_SLAVE, sll_slave_ldisc.name, status);
 			kfree(sllin_devs);
 		}
 	}

@@ -43,6 +43,6 @@
 #define N_SLLIN_SLAVE   32  /* LIN slave serial adapter */
 
 /* Always the newest line discipline + 1 */
-#define NR_LDISCS	32
+#define NR_LDISCS	33
 
 #endif /* _UAPI_LINUX_TTY_H */

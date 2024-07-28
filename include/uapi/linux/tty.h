@@ -39,8 +39,10 @@
 #define N_MCTP		28	/* MCTP-over-serial */
 #define N_DEVELOPMENT	29	/* Manual out-of-tree testing */
 #define N_CAN327	30	/* ELM327 based OBD-II interfaces */
+#define N_SLLIN		31  /* LIN master serial adapter  */
+#define N_SLLIN_SLAVE   32  /* LIN slave serial adapter */
 
 /* Always the newest line discipline + 1 */
-#define NR_LDISCS	31
+#define NR_LDISCS	33
 
 #endif /* _UAPI_LINUX_TTY_H */

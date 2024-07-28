@@ -52,6 +52,7 @@ obj-$(CONFIG_CAN) += can/
 ifdef CONFIG_NET_DSA
 obj-y += dsa/
 endif
+obj-$(CONFIG_LIN) += lin/
 obj-$(CONFIG_ETHERNET) += ethernet/
 obj-$(CONFIG_FDDI) += fddi/
 obj-$(CONFIG_HIPPI) += hippi/

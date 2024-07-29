@@ -71,7 +71,7 @@
 #endif
 
 static const char banner[] =
-	KERN_INFO "sllin: serial line LIN interface driver V2.0 \n";
+	KERN_INFO "sllin: serial line LIN interface driver V1.0 \n";
 
 MODULE_ALIAS_LDISC(N_SLLIN);
 MODULE_DESCRIPTION("serial line LIN interface");

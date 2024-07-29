@@ -71,7 +71,7 @@
 #endif
 
 static const char banner[] =
-	KERN_INFO "sllin: serial line LIN interface driver V1.0 \n";
+	KERN_INFO "sllin: serial line LIN interface driver \n";
 
 MODULE_ALIAS_LDISC(N_SLLIN);
 MODULE_DESCRIPTION("serial line LIN interface");
@@ -79,9 +79,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Pavel Pisa <pisa@cmp.felk.cvut.cz>");
 
 #define SLLIN_MAGIC		0x53CA
-
-#define N_SLLIN		31  /* LIN master serial adapter  */
-#define N_SLLIN_SLAVE   32  /* LIN slave serial adapter */
 
 /* Default kernel configuration options from Kconfig */
 #ifdef CONFIG_SLLIN_BAUDRATE

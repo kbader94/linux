@@ -97,6 +97,8 @@
 
 #define TIOCMIWAIT	0x545C	/* wait for a change on serial input line(s) */
 #define TIOCGICOUNT	0x545D	/* read serial port inline interrupt counts */
+#define TIOCSERFIFO     _IOW('T', 0x55, unsigned int) /* Set Serial FIFO Control */
+#define TIOCGSERFIFO    _IOR('T', 0x56, unsigned int) /* Get Serial FIFO Control */
 
 /*
  * Some arches already define FIOQSIZE due to a historical

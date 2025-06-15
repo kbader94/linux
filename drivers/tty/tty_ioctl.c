@@ -868,6 +868,52 @@ int tty_mode_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
 		up_write(&real_tty->termios_rwsem);
 		return ret;
 #endif
+#ifdef TIOCSERFIFO
+	case TIOCSERFIFO:
+	{
+		struct uart_state *state = tty->driver_data;
+		struct uart_port *port;
+		struct uart_fifo_control ctl;
+
+		if (!state || !state->uart_port)
+			return -ENOTTY;
+
+		port = state->uart_port;
+
+		if (!port->ops || !port->ops->set_fifo_control)
+			return -ENOTTY;
+
+		if (copy_from_user(&ctl, (void __user *)arg, sizeof(ctl)))
+			return -EFAULT;
+
+		return port->ops->set_fifo_control(port, &ctl);
+	}
+
+	case TIOCGSERFIFO:
+	{
+		struct uart_state *state = tty->driver_data;
+		struct uart_port *port;
+		struct uart_fifo_control ctl;
+		int ret;
+
+		if (!state || !state->uart_port)
+			return -ENOTTY;
+
+		port = state->uart_port;
+
+		if (!port->ops || !port->ops->get_fifo_control)
+			return -ENOTTY;
+
+		ret = port->ops->get_fifo_control(port, &ctl);
+		if (ret)
+			return ret;
+
+		if (copy_to_user((void __user *)arg, &ctl, sizeof(ctl)))
+			return -EFAULT;
+
+		return 0;
+	}
+#endif
 #ifdef TCGETX
 	case TCGETX:
 	case TCSETX:

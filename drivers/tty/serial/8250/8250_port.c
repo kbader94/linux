@@ -3230,6 +3230,69 @@ static const char *serial8250_type(struct uart_port *port)
 	return uart_config[type].name;
 }
 
+static int serial8250_set_fifo_control(struct uart_port *port,
+                                       const struct uart_fifo_control *ctl)
+{
+	struct uart_8250_port *up = container_of(port, struct uart_8250_port, port);
+	struct tty_port *tport;
+
+	if (!up->port.state)
+			return -ENODEV;
+
+	tport = &up->port.state->port;
+	
+	switch (port->type) {
+	case PORT_XR16C850:
+		if (ctl->rx_trigger_bytes < 1 || ctl->rx_trigger_bytes > 128)
+			return -EINVAL;
+
+
+	case PORT_16550A:
+	case PORT_16750:
+	default: {
+	
+		return do_serial8250_set_rxtrig(tport, ctl->rx_trigger_bytes);
+	}
+	}
+}
+
+int serial8250_set_fifo_control(struct uart_port *port,
+                                const struct uart_fifo_control *ctl)
+{
+	struct uart_8250_port *up = container_of(port, struct uart_8250_port, port);
+
+	if (!ctl)
+		return -EINVAL;
+
+	if (!up->port.state)
+		return -ENODEV;
+
+	/* TODO: set other registers and flags */
+	return do_serial8250_set_rxtrig(&up->port.state->port, ctl->rx_trigger_bytes);
+}
+
+int serial8250_get_fifo_control(struct uart_port *port,
+                                struct uart_fifo_control *ctl)
+{
+	struct uart_8250_port *up = container_of(port, struct uart_8250_port, port);
+	int rx_trig;
+
+	if (!ctl)
+		return -EINVAL;
+
+	if (!up->port.state)
+		return -ENODEV;
+
+	memset(ctl, 0, sizeof(*ctl));
+
+	rx_trig = serial8250_get_rxtrig(&up->port.state->port);
+	if (rx_trig < 0)
+		return rx_trig;
+
+	ctl->rx_trigger_bytes = rx_trig;
+	return 0;
+}
+
 static const struct uart_ops serial8250_pops = {
 	.tx_empty	= serial8250_tx_empty,
 	.set_mctrl	= serial8250_set_mctrl,
@@ -3252,6 +3315,8 @@ static const struct uart_ops serial8250_pops = {
 	.request_port	= serial8250_request_port,
 	.config_port	= serial8250_config_port,
 	.verify_port	= serial8250_verify_port,
+	.set_fifo_control = serial8250_set_fifo_control,
+	.get_fifo_control = serial8250_get_fifo_control,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_get_char = serial8250_get_poll_char,
 	.poll_put_char = serial8250_put_poll_char,

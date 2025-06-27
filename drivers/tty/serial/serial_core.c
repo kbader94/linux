@@ -2984,6 +2984,284 @@ static ssize_t console_store(struct device *dev,
 	return count;
 }
 
+static inline int uart_get_current_fctl(struct uart_port *uport,
+					struct uart_fifo_control *ctl)
+{
+	if (!uport->ops->get_fifo_control)
+		return -EOPNOTSUPP;
+
+	return uport->ops->get_fifo_control(uport, ctl);
+}
+
+static inline int uart_apply_fctl(struct uart_port *uport,
+				  const struct uart_fifo_control *ctl,
+				  enum uart_fifo_round round)
+{
+	if (!uport->ops->set_fifo_control)
+		return -EOPNOTSUPP;
+
+	return uport->ops->set_fifo_control(uport, ctl, round);
+}
+
+/**
+ * uart_get_fifo_control - read a port's cached FIFO control snapshot
+ * @port: serial port to query
+ * @ctl: out parameter, populated with the current cached state
+ *
+ * In-kernel API counterpart to the rx_trig_bytes / tx_trig_bytes /
+ * fifo_enable sysfs reads. Returns the driver's cached snapshot of the
+ * current FIFO state; does not touch hardware. Useful for in-kernel
+ * consumers (for example, line disciplines that need to read back the
+ * effective configuration before deciding whether to override it).
+ *
+ * Return: 0 on success and @ctl populated; %-EINVAL if @port or @ctl is
+ * %NULL; %-ENODEV if the port has been removed; %-EOPNOTSUPP if the
+ * bound driver does not implement %get_fifo_control.
+ *
+ * Context: process context; acquires tty_port->mutex briefly. May sleep.
+ */
+int uart_get_fifo_control(struct uart_port *port,
+			  struct uart_fifo_control *ctl)
+{
+	struct uart_state *state;
+
+	if (!port || !ctl)
+		return -EINVAL;
+
+	state = port->state;
+	if (!state)
+		return -ENODEV;
+
+	guard(mutex)(&state->port.mutex);
+	return uart_get_current_fctl(port, ctl);
+}
+EXPORT_SYMBOL_GPL(uart_get_fifo_control);
+
+/**
+ * uart_set_fifo_control - program FIFO control on a port from in-kernel
+ * @port: serial port to modify
+ * @ctl: requested FIFO state (enable flag plus RX/TX trigger levels)
+ * @round: how to handle requested trigger levels the part does not
+ *         support exactly; see &enum uart_fifo_round.
+ *
+ * In-kernel API counterpart to the rx_trig_bytes / tx_trig_bytes /
+ * fifo_enable sysfs writes. Intended for line disciplines and other
+ * in-kernel users that need programmatic FIFO control. For example, an
+ * sllin-style LIN line discipline needs a 1-byte RX trigger for break-
+ * detect timing and can fall back to disabling the FIFO via
+ * %UART_FIFO_CTRL_FLAG_ENABLE_FIFO cleared if a 1-byte level is not
+ * supported by the bound part.
+ *
+ * Serialises against sysfs writes and other in-kernel users via the
+ * tty_port mutex; the driver callback may take the port spin lock
+ * internally for register access.
+ *
+ * Return: 0 on success; %-EINVAL if @port or @ctl is %NULL; %-ENODEV if
+ * the port has been removed; %-EOPNOTSUPP if the bound driver does not
+ * implement %set_fifo_control; or another negative errno propagated
+ * from the driver (for example %-ERANGE when @round is
+ * %UART_FIFO_ROUND_EXACT and the requested level is not supported).
+ *
+ * Context: process context; acquires tty_port->mutex. May sleep.
+ */
+int uart_set_fifo_control(struct uart_port *port,
+			  const struct uart_fifo_control *ctl,
+			  enum uart_fifo_round round)
+{
+	struct uart_state *state;
+
+	if (!port || !ctl)
+		return -EINVAL;
+
+	state = port->state;
+	if (!state)
+		return -ENODEV;
+
+	guard(mutex)(&state->port.mutex);
+	return uart_apply_fctl(port, ctl, round);
+}
+EXPORT_SYMBOL_GPL(uart_set_fifo_control);
+
+static ssize_t rx_trig_bytes_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", ctl.rx_trigger_bytes);
+}
+
+static ssize_t rx_trig_bytes_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	u32 val;
+	u32 max_fifo;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	max_fifo = uport->fifosize ? uport->fifosize : 4096u;
+	val = min_t(u32, val, max_fifo);
+	if (!val)
+		return -EINVAL;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	/* Preserve legacy rx_trig_bytes ABI: round down to the next supported
+	 * level. The driver does the search; one set_fifo_control() call.
+	 */
+	ctl.rx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl, UART_FIFO_ROUND_DOWN);
+	return ret ? ret : count;
+}
+
+static ssize_t tx_trig_bytes_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%u\n", ctl.tx_trigger_bytes);
+}
+
+static ssize_t tx_trig_bytes_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	u32 val;
+	u32 max_fifo;
+	struct uart_fifo_control ctl;
+
+	int ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	max_fifo = uport->fifosize ? uport->fifosize : 4096u;
+	val = min_t(u32, val, max_fifo);
+	if (!val)
+		return -EINVAL;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	/* Round down to the next supported trigger, like rx_trig_bytes_store(). */
+	ctl.tx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl, UART_FIFO_ROUND_DOWN);
+	return ret ? ret : count;
+}
+
+static ssize_t fifo_enable_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", !!(ctl.flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO));
+}
+
+static ssize_t fifo_enable_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport;
+	bool enable;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&port->mutex);
+
+	uport = uart_port_check(state);
+	if (!uport)
+		return -ENODEV;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ctl.flags |= UART_FIFO_CTRL_FLAG_ENABLE_FIFO;
+	else
+		ctl.flags &= ~UART_FIFO_CTRL_FLAG_ENABLE_FIFO;
+
+	/*
+	 * Trigger levels in @ctl came from the driver's cached snapshot, so
+	 * they are already at supported values; ask for them to be reapplied
+	 * exactly rather than rounded.
+	 */
+	ret = uart_apply_fctl(uport, &ctl, UART_FIFO_ROUND_EXACT);
+	return ret ? ret : count;
+}
+
 static DEVICE_ATTR_RO(uartclk);
 static DEVICE_ATTR_RO(type);
 static DEVICE_ATTR_RO(line);
@@ -2998,6 +3276,9 @@ static DEVICE_ATTR_RO(io_type);
 static DEVICE_ATTR_RO(iomem_base);
 static DEVICE_ATTR_RO(iomem_reg_shift);
 static DEVICE_ATTR_RW(console);
+static DEVICE_ATTR_RW(rx_trig_bytes);
+static DEVICE_ATTR_RW(tx_trig_bytes);
+static DEVICE_ATTR_RW(fifo_enable);
 
 static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_uartclk.attr,
@@ -3017,9 +3298,71 @@ static struct attribute *tty_dev_attrs[] = {
 	NULL
 };
 
+static struct attribute *tty_fifo_attrs[] = {
+	&dev_attr_rx_trig_bytes.attr,
+	&dev_attr_tx_trig_bytes.attr,
+	&dev_attr_fifo_enable.attr,
+	NULL,
+};
+
 static const struct attribute_group tty_dev_attr_group = {
 	.attrs = tty_dev_attrs,
 };
+
+/* FIFO Control sysfs attributes:
+ * - fifo_enable: visible if device uart_ops->get_fifo_control succeeds
+ * - rx_trig_bytes: visible if ctl.rx_trigger_bytes != 0
+ * - tx_trig_bytes: visible if ctl.tx_trigger_bytes != 0
+ *
+ * Drivers return 0 in rx/tx_trigger_bytes by default if
+ * device doesn't support programmable FIFO trigger levels.
+ */
+static umode_t tty_fifo_control_visibility(struct kobject *kobj,
+				    struct attribute *attr, int n)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state;
+	struct uart_port *uport;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	if (!port)
+		return 0;
+
+	state = container_of(port, struct uart_state, port);
+	uport  = state->uart_port;
+
+	if (!uport || !uport->ops->get_fifo_control)
+		return 0;
+
+	ret = uport->ops->get_fifo_control(uport, &ctl);
+	if (ret)
+		return 0; /* hide rx/tx if no FIFO or op fails */
+
+	if (attr == &dev_attr_fifo_enable.attr)
+		return attr->mode;
+
+	if (attr == &dev_attr_rx_trig_bytes.attr)
+		return ctl.rx_trigger_bytes ? attr->mode : 0;
+
+	if (attr == &dev_attr_tx_trig_bytes.attr)
+		return ctl.tx_trigger_bytes ? attr->mode : 0;
+
+	return 0;
+}
+
+static const struct attribute_group tty_fifo_attr_group = {
+	.attrs      = tty_fifo_attrs,
+	.is_visible = tty_fifo_control_visibility,
+};
+
+static const struct attribute_group *tty_attr_groups[] = {
+	&tty_dev_attr_group,
+	&tty_fifo_attr_group,
+	NULL,
+};
+
 
 /**
  * serial_core_add_one_port - attach a driver-defined port structure
@@ -3038,7 +3381,6 @@ static int serial_core_add_one_port(struct uart_driver *drv, struct uart_port *u
 	struct uart_state *state;
 	struct tty_port *port;
 	struct device *tty_dev;
-	int num_groups;
 
 	if (uport->line >= drv->nr)
 		return -EINVAL;
@@ -3084,18 +3426,7 @@ static int serial_core_add_one_port(struct uart_driver *drv, struct uart_port *u
 
 	port->console = uart_console(uport);
 
-	num_groups = 2;
-	if (uport->attr_group)
-		num_groups++;
-
-	uport->tty_groups = kcalloc(num_groups, sizeof(*uport->tty_groups),
-				    GFP_KERNEL);
-	if (!uport->tty_groups)
-		return -ENOMEM;
-
-	uport->tty_groups[0] = &tty_dev_attr_group;
-	if (uport->attr_group)
-		uport->tty_groups[1] = uport->attr_group;
+	uport->tty_groups = tty_attr_groups;
 
 	/* Ensure serdev drivers can call serdev_device_open() right away */
 	uport->flags &= ~UPF_DEAD;
@@ -3163,7 +3494,7 @@ static void serial_core_remove_one_port(struct uart_driver *drv,
 	 */
 	if (uport->type != PORT_UNKNOWN && uport->ops->release_port)
 		uport->ops->release_port(uport);
-	kfree(uport->tty_groups);
+
 	kfree(uport->name);
 
 	/*

@@ -28,10 +28,34 @@
 #endif
 
 struct uart_port;
+struct uart_fifo_control;
 struct serial_struct;
 struct serial_port_device;
 struct device;
 struct gpio_desc;
+
+/**
+ * enum uart_fifo_round - policy for choosing an actual FIFO trigger level
+ * @UART_FIFO_ROUND_DOWN:  use the largest supported level <= the request.
+ *                         Used by the legacy rx_trig_bytes / tx_trig_bytes
+ *                         sysfs writes so userspace can write any value and
+ *                         get the nearest level the part can actually
+ *                         program.
+ * @UART_FIFO_ROUND_EXACT: fail with -ERANGE if the request is not exactly
+ *                         supported. Useful for in-kernel callers (e.g. a
+ *                         line discipline configuring LIN break detect)
+ *                         that need a specific level or must abort.
+ * @UART_FIFO_ROUND_UP:    use the smallest supported level >= the request.
+ *
+ * Drivers honour @round in @set_fifo_control by searching their supported-
+ * level table (or, for continuous-range parts, clamping); see
+ * &struct uart_ops.set_fifo_control.
+ */
+enum uart_fifo_round {
+	UART_FIFO_ROUND_DOWN = 0,
+	UART_FIFO_ROUND_EXACT,
+	UART_FIFO_ROUND_UP,
+};
 
 /**
  * struct uart_ops -- interface between serial_core and the driver
@@ -399,12 +423,38 @@ struct uart_ops {
 	void		(*config_port)(struct uart_port *, int);
 	int		(*verify_port)(struct uart_port *, struct serial_struct *);
 	int		(*ioctl)(struct uart_port *, unsigned int, unsigned long);
+	int     	(*set_fifo_control)(struct uart_port *port,
+					    const struct uart_fifo_control *ctl,
+					    enum uart_fifo_round round);
+	int 		(*get_fifo_control)(struct uart_port *port,
+					    struct uart_fifo_control *ctl);
 #ifdef CONFIG_CONSOLE_POLL
 	int		(*poll_init)(struct uart_port *);
 	void		(*poll_put_char)(struct uart_port *, unsigned char);
 	int		(*poll_get_char)(struct uart_port *);
 #endif
 };
+
+/**
+ * struct uart_fifo_control - FIFO control snapshot / request
+ * @flags:            control/state bits; see UART_FIFO_CTRL_FLAG_*.
+ * @rx_trigger_bytes: RX FIFO trigger level in bytes; 0 if not programmable.
+ * @tx_trigger_bytes: TX FIFO trigger level in bytes; 0 if not programmable.
+ *
+ */
+struct uart_fifo_control {
+	u32 flags;
+	u32 rx_trigger_bytes;
+	u32 tx_trigger_bytes;
+};
+
+#define UART_FIFO_CTRL_FLAG_ENABLE_FIFO	BIT(0)
+
+int uart_get_fifo_control(struct uart_port *port,
+			  struct uart_fifo_control *ctl);
+int uart_set_fifo_control(struct uart_port *port,
+			  const struct uart_fifo_control *ctl,
+			  enum uart_fifo_round round);
 
 #define NO_POLL_CHAR		0x00ff0000
 #define UART_CONFIG_TYPE	(1 << 0)
@@ -588,7 +638,6 @@ struct uart_port {
 	unsigned char		suspended;
 	unsigned char		console_reinit;
 	const char		*name;			/* port name */
-	struct attribute_group	*attr_group;		/* port specific attributes */
 	const struct attribute_group **tty_groups;	/* all attributes (serial core use only) */
 	struct serial_rs485     rs485;
 	struct serial_rs485	rs485_supported;	/* Supported mask for serial_rs485 */

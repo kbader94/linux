@@ -22,6 +22,7 @@
 #include <linux/seq_file.h>
 #include <linux/device.h>
 #include <linux/serial.h> /* for serial_state and serial_icounter_struct */
+#include <linux/serial_fifo.h> /* for fifo control */
 #include <linux/serial_core.h>
 #include <linux/sysrq.h>
 #include <linux/delay.h>
@@ -3037,6 +3038,140 @@ static ssize_t console_store(struct device *dev,
 	return count;
 }
 
+static inline int uart_get_current_fctl(struct uart_port *uport, struct uart_fifo_control *fc)
+{
+	if (!uport->ops->get_fifo_control)
+		return -EOPNOTSUPP;
+	
+	return uport->ops->get_fifo_control(uport, fc);
+}
+
+static inline int uart_apply_fctl(struct uart_port *uport, struct uart_fifo_control *fc)
+{
+	if (!uport->ops->set_fifo_control)
+		return -EOPNOTSUPP;
+
+	return uport->ops->set_fifo_control(uport, fc);
+}
+
+static ssize_t rx_trig_bytes_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	int ret = uart_get_current_fctl(uport, &ctl);
+
+	if (ret)
+		return ret;
+	else 
+		return sysfs_emit(buf, "%u\n", ctl.rx_trigger_bytes);
+}
+
+static ssize_t rx_trig_bytes_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	u32 val;
+	int ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	ctl.rx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t tx_trig_bytes_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	int ret = uart_get_current_fctl(uport, &ctl);
+
+	if (ret)
+		return ret;
+	else 
+		return sysfs_emit(buf, "%u\n", ctl.tx_trigger_bytes);
+}
+
+static ssize_t tx_trig_bytes_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	u32 val;
+
+	int ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	ctl.tx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t fifo_enable_show(struct device *dev,
+                                   struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	int ret;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+	else
+		return sysfs_emit(buf, "%u\n", !!(ctl.flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO));
+}
+
+static ssize_t fifo_enable_store(struct device *dev,
+                                    struct device_attribute *attr,
+                                    const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	struct uart_fifo_control ctl;
+	bool enable;
+
+	int ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	ret = uart_get_current_fctl(uport, &ctl);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ctl.flags |= UART_FIFO_CTRL_FLAG_ENABLE_FIFO;
+	else
+		ctl.flags &= ~UART_FIFO_CTRL_FLAG_ENABLE_FIFO;
+
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
 static DEVICE_ATTR_RO(uartclk);
 static DEVICE_ATTR_RO(type);
 static DEVICE_ATTR_RO(line);
@@ -3051,6 +3186,9 @@ static DEVICE_ATTR_RO(io_type);
 static DEVICE_ATTR_RO(iomem_base);
 static DEVICE_ATTR_RO(iomem_reg_shift);
 static DEVICE_ATTR_RW(console);
+static DEVICE_ATTR_RW(rx_trig_bytes);
+static DEVICE_ATTR_RW(tx_trig_bytes);
+static DEVICE_ATTR_RW(fifo_enable);
 
 static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_uartclk.attr,
@@ -3067,6 +3205,9 @@ static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_iomem_base.attr,
 	&dev_attr_iomem_reg_shift.attr,
 	&dev_attr_console.attr,
+	&dev_attr_rx_trig_bytes.attr,
+	&dev_attr_tx_trig_bytes.attr,
+	&dev_attr_fifo_enable.attr,
 	NULL
 };
 

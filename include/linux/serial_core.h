@@ -28,6 +28,7 @@
 #endif
 
 struct uart_port;
+struct uart_fifo_control;
 struct serial_struct;
 struct serial_port_device;
 struct device;
@@ -399,6 +400,10 @@ struct uart_ops {
 	void		(*config_port)(struct uart_port *, int);
 	int		(*verify_port)(struct uart_port *, struct serial_struct *);
 	int		(*ioctl)(struct uart_port *, unsigned int, unsigned long);
+	int     	(*set_fifo_control)(struct uart_port *port,
+                            		const struct uart_fifo_control *ctl);
+    int 		(*get_fifo_control)(struct uart_port *port,
+                            		struct uart_fifo_control *ctl);
 #ifdef CONFIG_CONSOLE_POLL
 	int		(*poll_init)(struct uart_port *);
 	void		(*poll_put_char)(struct uart_port *, unsigned char);

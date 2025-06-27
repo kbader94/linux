@@ -98,9 +98,14 @@
 					some Freescale UARTs) */
 
 #define UART_FCR_R_TRIG_SHIFT		6
+#define UART_FCR_R_FROM_TRIG_I(i)		\
+	((i) << UART_FCR_R_TRIG_SHIFT)
 #define UART_FCR_R_TRIG_BITS(x)		\
 	(((x) & UART_FCR_TRIGGER_MASK) >> UART_FCR_R_TRIG_SHIFT)
-#define UART_FCR_R_TRIG_MAX_STATE	4
+
+#define UART_FCR_T_TRIG_MAX_STATE			4
+#define UART_FCR_R_TRIG_MAX_STATE		    4  	/* Max states for CAP_FIFO  */
+#define UART_FIFO_X_TRIG_MAX_STATE 			16 	/* Max states for CAP_XFIFO */ 
 
 #define UART_LCR	3	/* Out: Line Control Register */
 /*

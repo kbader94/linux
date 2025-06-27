@@ -6,6 +6,7 @@
 obj-$(CONFIG_SERIAL_8250)		+= 8250.o
 8250-y					:= 8250_core.o
 8250-y					+= 8250_platform.o
+8250-y				    += 8250_fifo.o
 8250-$(CONFIG_SERIAL_8250_PNP)		+= 8250_pnp.o
 8250-$(CONFIG_SERIAL_8250_RSA)		+= 8250_rsa.o
 

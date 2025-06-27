@@ -11,6 +11,7 @@
 #include <linux/serial_core.h>
 #include <linux/serial_reg.h>
 #include <linux/platform_device.h>
+#include <linux/serial_fifo.h>
 
 struct uart_8250_port;
 
@@ -95,6 +96,10 @@ struct uart_8250_ops {
 	int		(*setup_irq)(struct uart_8250_port *);
 	void		(*release_irq)(struct uart_8250_port *);
 	void		(*setup_timer)(struct uart_8250_port *);
+	int 	(*set_fifo_control)(struct uart_port *port, 
+								const struct uart_fifo_control *ctl);
+    int 	(*get_fifo_control)(struct uart_port *port, 
+								struct uart_fifo_control *ctl);
 };
 
 struct uart_8250_em485 {
@@ -163,10 +168,13 @@ struct uart_8250_port {
 	struct uart_8250_em485 *em485;
 	void			(*rs485_start_tx)(struct uart_8250_port *up, bool toggle_ier);
 	void			(*rs485_stop_tx)(struct uart_8250_port *up, bool toggle_ier);
-
+	
 	/* Serial port overrun backoff */
 	struct delayed_work overrun_backoff;
 	u32 overrun_backoff_time_ms;
+
+	/* Serial port FIFO control */
+	struct uart_fifo_control	fifo_control;
 };
 
 static inline struct uart_8250_port *up_to_u8250p(struct uart_port *up)

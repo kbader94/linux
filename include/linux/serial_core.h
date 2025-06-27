@@ -28,6 +28,7 @@
 #endif
 
 struct uart_port;
+struct uart_fifo_control;
 struct serial_struct;
 struct serial_port_device;
 struct device;
@@ -399,12 +400,31 @@ struct uart_ops {
 	void		(*config_port)(struct uart_port *, int);
 	int		(*verify_port)(struct uart_port *, struct serial_struct *);
 	int		(*ioctl)(struct uart_port *, unsigned int, unsigned long);
+	int     	(*set_fifo_control)(struct uart_port *port,
+					    const struct uart_fifo_control *ctl);
+	int 		(*get_fifo_control)(struct uart_port *port,
+					    struct uart_fifo_control *ctl);
 #ifdef CONFIG_CONSOLE_POLL
 	int		(*poll_init)(struct uart_port *);
 	void		(*poll_put_char)(struct uart_port *, unsigned char);
 	int		(*poll_get_char)(struct uart_port *);
 #endif
 };
+
+/**
+ * struct uart_fifo_control - FIFO control snapshot / request
+ * @flags:            control/state bits; see UART_FIFO_CTRL_FLAG_*.
+ * @rx_trigger_bytes: RX FIFO trigger level in bytes; 0 if not programmable.
+ * @tx_trigger_bytes: TX FIFO trigger level in bytes; 0 if not programmable.
+ *
+ */
+struct uart_fifo_control {
+	u32 flags;
+	u32 rx_trigger_bytes;
+	u32 tx_trigger_bytes;
+};
+
+#define UART_FIFO_CTRL_FLAG_ENABLE_FIFO	BIT(0)
 
 #define NO_POLL_CHAR		0x00ff0000
 #define UART_CONFIG_TYPE	(1 << 0)

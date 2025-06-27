@@ -22,6 +22,7 @@
 #include <linux/seq_file.h>
 #include <linux/device.h>
 #include <linux/serial.h> /* for serial_state and serial_icounter_struct */
+#include <linux/serial_fifo.h> /* for fifo control */
 #include <linux/serial_core.h>
 #include <linux/sysrq.h>
 #include <linux/delay.h>
@@ -3064,6 +3065,243 @@ static ssize_t console_store(struct device *dev,
 	return count;
 }
 
+static inline struct uart_fifo_control uart_get_current_fctl(struct uart_port *uport, int *ret)
+{
+	struct uart_fifo_control ctl;
+
+	if (!uport->ops->get_fifo_control) {
+		*ret = -EOPNOTSUPP;
+		return (struct uart_fifo_control){ 0 };
+	}
+
+	*ret = uport->ops->get_fifo_control(uport, &ctl);
+	return ctl;
+}
+
+static inline int uart_apply_fctl(struct uart_port *uport, struct uart_fifo_control *ctl)
+{
+	if (!uport->ops->set_fifo_control)
+		return -EOPNOTSUPP;
+
+	return uport->ops->set_fifo_control(uport, ctl);
+}
+
+static ssize_t rx_trig_bytes_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", ctl.rx_trigger_bytes);
+}
+
+static ssize_t rx_trig_bytes_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	u32 val;
+	int ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	ctl.rx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t tx_trig_bytes_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", ctl.tx_trigger_bytes);
+}
+
+static ssize_t tx_trig_bytes_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	u32 val;
+	int ret = kstrtou32(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	ctl.tx_trigger_bytes = val;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t fifo_enable_rx_show(struct device *dev,
+                                   struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", !!(ctl.flags & UART_FIFO_CTRL_FLAG_ENABLE_RX));
+}
+
+static ssize_t fifo_enable_rx_store(struct device *dev,
+                                    struct device_attribute *attr,
+                                    const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ctl.flags |= UART_FIFO_CTRL_FLAG_ENABLE_RX;
+	else
+		ctl.flags &= ~UART_FIFO_CTRL_FLAG_ENABLE_RX;
+
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t fifo_enable_tx_show(struct device *dev,
+                                   struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", !!(ctl.flags & UART_FIFO_CTRL_FLAG_ENABLE_TX));
+}
+
+static ssize_t fifo_enable_tx_store(struct device *dev,
+                                    struct device_attribute *attr,
+                                    const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ctl.flags |= UART_FIFO_CTRL_FLAG_ENABLE_TX;
+	else
+		ctl.flags &= ~UART_FIFO_CTRL_FLAG_ENABLE_TX;
+
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t dma_mode_show(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u\n", !!(ctl.flags & UART_FIFO_CTRL_FLAG_DMA_MODE));
+}
+
+static ssize_t dma_mode_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	bool enable;
+	int ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ctl.flags |= UART_FIFO_CTRL_FLAG_DMA_MODE;
+	else
+		ctl.flags &= ~UART_FIFO_CTRL_FLAG_DMA_MODE;
+
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t flush_rx_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	ctl.flags |= UART_FIFO_CTRL_FLAG_FLUSH_RX;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
+static ssize_t flush_tx_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+	struct tty_port *port = dev_get_drvdata(dev);
+	struct uart_state *state = container_of(port, struct uart_state, port);
+	struct uart_port *uport = state->uart_port;
+	int ret;
+	struct uart_fifo_control ctl = uart_get_current_fctl(uport, &ret);
+	if (ret)
+		return ret;
+
+	ctl.flags |= UART_FIFO_CTRL_FLAG_FLUSH_TX;
+	ret = uart_apply_fctl(uport, &ctl);
+	return ret ? ret : count;
+}
+
 static DEVICE_ATTR_RO(uartclk);
 static DEVICE_ATTR_RO(type);
 static DEVICE_ATTR_RO(line);
@@ -3078,6 +3316,14 @@ static DEVICE_ATTR_RO(io_type);
 static DEVICE_ATTR_RO(iomem_base);
 static DEVICE_ATTR_RO(iomem_reg_shift);
 static DEVICE_ATTR_RW(console);
+
+static DEVICE_ATTR_RW(rx_trig_bytes);
+static DEVICE_ATTR_RW(tx_trig_bytes);
+static DEVICE_ATTR_RW(fifo_enable_rx);
+static DEVICE_ATTR_RW(fifo_enable_tx);
+static DEVICE_ATTR_RW(dma_mode);
+static DEVICE_ATTR_WO(flush_rx);
+static DEVICE_ATTR_WO(flush_tx);
 
 static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_uartclk.attr,
@@ -3094,6 +3340,13 @@ static struct attribute *tty_dev_attrs[] = {
 	&dev_attr_iomem_base.attr,
 	&dev_attr_iomem_reg_shift.attr,
 	&dev_attr_console.attr,
+	&dev_attr_rx_trig_bytes.attr,
+	&dev_attr_tx_trig_bytes.attr,
+	&dev_attr_fifo_enable_rx.attr,
+	&dev_attr_fifo_enable_tx.attr,
+	&dev_attr_dma_mode.attr,
+	&dev_attr_flush_rx.attr,
+	&dev_attr_flush_tx.attr,
 	NULL
 };
 

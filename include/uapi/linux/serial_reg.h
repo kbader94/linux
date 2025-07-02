@@ -85,6 +85,9 @@
 #define UART_FCR_TRIGGER_4	0x40 /* Mask for trigger set at 4 */
 #define UART_FCR_TRIGGER_8	0x80 /* Mask for trigger set at 8 */
 #define UART_FCR_TRIGGER_14	0xC0 /* Mask for trigger set at 14 */
+
+#define UART_FCR_TX_TRIGGER_MASK	0x30 /* Mask for the tx FIFO trigger */
+
 /* 16650 definitions */
 #define UART_FCR6_R_TRIGGER_8	0x00 /* Mask for receive trigger set at 1 */
 #define UART_FCR6_R_TRIGGER_16	0x40 /* Mask for receive trigger set at 4 */
@@ -97,10 +100,19 @@
 #define UART_FCR7_64BYTE	0x20 /* Go into 64 byte mode (TI16C750 and
 					some Freescale UARTs) */
 
-#define UART_FCR_R_TRIG_SHIFT		6
-#define UART_FCR_R_TRIG_BITS(x)		\
-	(((x) & UART_FCR_TRIGGER_MASK) >> UART_FCR_R_TRIG_SHIFT)
-#define UART_FCR_R_TRIG_MAX_STATE	4
+#define UART_FCR_R_TRIG_SHIFT				6
+#define UART_FCR_R_FROM_TRIG_I(i)	  		((i) << UART_FCR_R_TRIG_SHIFT)
+#define UART_FCR_R_TRIG_BITS(x)		  		\
+						(((x) & UART_FCR_TRIGGER_MASK) >> UART_FCR_R_TRIG_SHIFT)
+
+#define UART_FCR_T_TRIG_SHIFT         		4
+#define UART_FCR_T_TRIGGER_MASK       		(0x3 << UART_FCR_T_TRIG_SHIFT)
+#define UART_FCR_T_FROM_TRIG_I(i)     		((i) << UART_FCR_T_TRIG_SHIFT)
+#define UART_FCR_T_TRIG_BITS(x)       		\
+				      (((x) & UART_FCR_T_TRIGGER_MASK) >> UART_FCR_T_TRIG_SHIFT)
+
+#define UART_FCR_T_TRIG_MAX_STATE			8
+#define UART_FCR_R_TRIG_MAX_STATE		    8  
 
 #define UART_LCR	3	/* Out: Line Control Register */
 /*

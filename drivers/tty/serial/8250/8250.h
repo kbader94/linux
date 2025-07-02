@@ -70,7 +70,11 @@ struct serial8250_config {
 	unsigned short	tx_loadsz;
 	unsigned char	fcr;
 	unsigned char	rxtrig_bytes[UART_FCR_R_TRIG_MAX_STATE];
+	unsigned char 	txtrig_bytes[UART_FCR_T_TRIG_MAX_STATE];
 	unsigned int	flags;
+	int (*set_fifo_control)
+				(struct uart_port *port, const struct uart_fifo_control *ctl);
+	struct uart_fifo_control fifo_control;
 };
 
 #define UART_CAP_FIFO	BIT(8)	/* UART has FIFO */
@@ -131,6 +135,7 @@ extern struct platform_device *serial8250_isa_devs;
 
 extern const struct uart_ops *univ8250_port_base_ops;
 extern struct uart_ops univ8250_port_ops;
+extern const struct serial8250_config serial8250_uart_config[];
 
 static inline int serial_in(struct uart_8250_port *up, int offset)
 {

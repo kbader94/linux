@@ -11,6 +11,7 @@
 #include <linux/serial_core.h>
 #include <linux/serial_reg.h>
 #include <linux/platform_device.h>
+#include <linux/serial_fifo.h>
 
 struct uart_8250_port;
 
@@ -167,6 +168,9 @@ struct uart_8250_port {
 	/* Serial port overrun backoff */
 	struct delayed_work overrun_backoff;
 	u32 overrun_backoff_time_ms;
+
+	/* Serial port FIFO control */
+	struct uart_fifo_control	fifo_control;
 };
 
 static inline struct uart_8250_port *up_to_u8250p(struct uart_port *up)

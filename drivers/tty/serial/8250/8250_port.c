@@ -32,11 +32,13 @@
 #include <linux/uaccess.h>
 #include <linux/pm_runtime.h>
 #include <linux/ktime.h>
+#include <linux/serial_fifo.h>
 
 #include <asm/io.h>
 #include <asm/irq.h>
 
 #include "8250.h"
+#include "8250_fifo.h"
 
 /*
  * Debugging.
@@ -47,10 +49,7 @@
 #define DEBUG_AUTOCONF(fmt...)	do { } while (0)
 #endif
 
-/*
- * Here we define the default xmit fifo size used for each type of UART.
- */
-static const struct serial8250_config uart_config[] = {
+const struct serial8250_config serial8250_uart_config[] = {
 	[PORT_UNKNOWN] = {
 		.name		= "unknown",
 		.fifo_size	= 1,
@@ -76,12 +75,17 @@ static const struct serial8250_config uart_config[] = {
 		.fifo_size	= 16,
 		.tx_loadsz	= 16,
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10,
-		.rxtrig_bytes	= {1, 4, 8, 14},
+		.rxtrig_bytes			= {1, 4, 8, 14},
 		.flags		= UART_CAP_FIFO,
+		.fifo_control = {
+			.flags 			= UART_FIFO_CTRL_FLAG_ENABLE_RX | 
+							  UART_FIFO_CTRL_FLAG_ENABLE_TX  ,
+			.rx_trigger_bytes = 8,	
+		}
 	},
 	[PORT_CIRRUS] = {
 		.name		= "Cirrus",
-		.fifo_size	= 1,
+		.fifo_size	= 1,                
 		.tx_loadsz	= 1,
 	},
 	[PORT_16650] = {
@@ -96,8 +100,16 @@ static const struct serial8250_config uart_config[] = {
 		.tx_loadsz	= 16,
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01 |
 				  UART_FCR_T_TRIG_00,
-		.rxtrig_bytes	= {8, 16, 24, 28},
-		.flags		= UART_CAP_FIFO | UART_CAP_EFR | UART_CAP_SLEEP,
+		.rxtrig_bytes			= {8, 16, 24, 28},
+		.txtrig_bytes			= {16, 8, 24, 30},
+		.flags		= UART_CAP_FIFO | UART_CAP_EFR | 
+				  UART_CAP_SLEEP,		  
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_RX | 
+							  	UART_FIFO_CTRL_FLAG_ENABLE_TX  ,
+			.rx_trigger_bytes = 16,	
+			.tx_trigger_bytes = 16,			
+		}
 	},
 	[PORT_16750] = {
 		.name		= "TI16750",
@@ -1264,10 +1276,10 @@ static void autoconfig(struct uart_8250_port *up)
 
 	serial_out(up, UART_LCR, save_lcr);
 
-	port->fifosize = uart_config[up->port.type].fifo_size;
+	port->fifosize = serial8250_uart_config[up->port.type].fifo_size;
 	old_capabilities = up->capabilities;
-	up->capabilities = uart_config[port->type].flags;
-	up->tx_loadsz = uart_config[port->type].tx_loadsz;
+	up->capabilities = serial8250_uart_config[port->type].flags;
+	up->tx_loadsz = serial8250_uart_config[port->type].tx_loadsz;
 
 	if (port->type == PORT_UNKNOWN)
 		goto out_unlock;
@@ -1299,7 +1311,7 @@ out_unlock:
 	}
 out:
 	DEBUG_AUTOCONF("iir=%d ", scratch);
-	DEBUG_AUTOCONF("type=%s\n", uart_config[port->type].name);
+	DEBUG_AUTOCONF("type=%s\n", serial8250_uart_config[port->type].name);
 }
 
 static void autoconfig_irq(struct uart_8250_port *up)
@@ -2173,11 +2185,11 @@ int serial8250_do_startup(struct uart_port *port)
 	u16 lsr;
 
 	if (!port->fifosize)
-		port->fifosize = uart_config[port->type].fifo_size;
+		port->fifosize = serial8250_uart_config[port->type].fifo_size;
 	if (!up->tx_loadsz)
-		up->tx_loadsz = uart_config[port->type].tx_loadsz;
+		up->tx_loadsz = serial8250_uart_config[port->type].tx_loadsz;
 	if (!up->capabilities)
-		up->capabilities = uart_config[port->type].flags;
+		up->capabilities = serial8250_uart_config[port->type].flags;
 	up->mcr = 0;
 
 	if (port->iotype != up->cur_iotype)
@@ -2747,6 +2759,8 @@ serial8250_do_set_termios(struct uart_port *port, struct ktermios *termios,
 		if (baud < 2400 && !up->dma) {
 			up->fcr &= ~UART_FCR_TRIGGER_MASK;
 			up->fcr |= UART_FCR_TRIGGER_1;
+			//TODO: this isn't always 1, we should fetch rx_trigger_bytes[0] from uart_config
+			up->fifo_control.rx_trigger_bytes = 1;
 		}
 	}
 
@@ -3005,141 +3019,6 @@ static int serial8250_request_port(struct uart_port *port)
 	return serial8250_request_std_resource(up);
 }
 
-static int fcr_get_rxtrig_bytes(struct uart_8250_port *up)
-{
-	const struct serial8250_config *conf_type = &uart_config[up->port.type];
-	unsigned char bytes;
-
-	bytes = conf_type->rxtrig_bytes[UART_FCR_R_TRIG_BITS(up->fcr)];
-
-	return bytes ? bytes : -EOPNOTSUPP;
-}
-
-static int bytes_to_fcr_rxtrig(struct uart_8250_port *up, unsigned char bytes)
-{
-	const struct serial8250_config *conf_type = &uart_config[up->port.type];
-	int i;
-
-	if (!conf_type->rxtrig_bytes[UART_FCR_R_TRIG_BITS(UART_FCR_R_TRIG_00)])
-		return -EOPNOTSUPP;
-
-	for (i = 1; i < UART_FCR_R_TRIG_MAX_STATE; i++) {
-		if (bytes < conf_type->rxtrig_bytes[i])
-			/* Use the nearest lower value */
-			return (--i) << UART_FCR_R_TRIG_SHIFT;
-	}
-
-	return UART_FCR_R_TRIG_11;
-}
-
-static int do_get_rxtrig(struct tty_port *port)
-{
-	struct uart_state *state = container_of(port, struct uart_state, port);
-	struct uart_port *uport = state->uart_port;
-	struct uart_8250_port *up = up_to_u8250p(uport);
-
-	if (!(up->capabilities & UART_CAP_FIFO) || uport->fifosize <= 1)
-		return -EINVAL;
-
-	return fcr_get_rxtrig_bytes(up);
-}
-
-static int do_serial8250_get_rxtrig(struct tty_port *port)
-{
-	int rxtrig_bytes;
-
-	mutex_lock(&port->mutex);
-	rxtrig_bytes = do_get_rxtrig(port);
-	mutex_unlock(&port->mutex);
-
-	return rxtrig_bytes;
-}
-
-static ssize_t rx_trig_bytes_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct tty_port *port = dev_get_drvdata(dev);
-	int rxtrig_bytes;
-
-	rxtrig_bytes = do_serial8250_get_rxtrig(port);
-	if (rxtrig_bytes < 0)
-		return rxtrig_bytes;
-
-	return sysfs_emit(buf, "%d\n", rxtrig_bytes);
-}
-
-static int do_set_rxtrig(struct tty_port *port, unsigned char bytes)
-{
-	struct uart_state *state = container_of(port, struct uart_state, port);
-	struct uart_port *uport = state->uart_port;
-	struct uart_8250_port *up = up_to_u8250p(uport);
-	int rxtrig;
-
-	if (!(up->capabilities & UART_CAP_FIFO) || uport->fifosize <= 1)
-		return -EINVAL;
-
-	rxtrig = bytes_to_fcr_rxtrig(up, bytes);
-	if (rxtrig < 0)
-		return rxtrig;
-
-	serial8250_clear_fifos(up);
-	up->fcr &= ~UART_FCR_TRIGGER_MASK;
-	up->fcr |= (unsigned char)rxtrig;
-	serial_out(up, UART_FCR, up->fcr);
-	return 0;
-}
-
-static int do_serial8250_set_rxtrig(struct tty_port *port, unsigned char bytes)
-{
-	int ret;
-
-	mutex_lock(&port->mutex);
-	ret = do_set_rxtrig(port, bytes);
-	mutex_unlock(&port->mutex);
-
-	return ret;
-}
-
-static ssize_t rx_trig_bytes_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct tty_port *port = dev_get_drvdata(dev);
-	unsigned char bytes;
-	int ret;
-
-	if (!count)
-		return -EINVAL;
-
-	ret = kstrtou8(buf, 10, &bytes);
-	if (ret < 0)
-		return ret;
-
-	ret = do_serial8250_set_rxtrig(port, bytes);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-static DEVICE_ATTR_RW(rx_trig_bytes);
-
-static struct attribute *serial8250_dev_attrs[] = {
-	&dev_attr_rx_trig_bytes.attr,
-	NULL
-};
-
-static struct attribute_group serial8250_dev_attr_group = {
-	.attrs = serial8250_dev_attrs,
-};
-
-static void register_dev_spec_attr_grp(struct uart_8250_port *up)
-{
-	const struct serial8250_config *conf_type = &uart_config[up->port.type];
-
-	if (conf_type->rxtrig_bytes[0])
-		up->port.attr_group = &serial8250_dev_attr_group;
-}
-
 static void serial8250_config_port(struct uart_port *port, int flags)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
@@ -3169,8 +3048,9 @@ static void serial8250_config_port(struct uart_port *port, int flags)
 	if (port->type == PORT_UNKNOWN)
 		serial8250_release_std_resource(up);
 
-	register_dev_spec_attr_grp(up);
-	up->fcr = uart_config[up->port.type].fcr;
+	up->fcr = serial8250_uart_config[up->port.type].fcr;
+	up->fifo_control = serial8250_uart_config[up->port.type].fifo_control;
+
 }
 
 static int
@@ -3178,7 +3058,7 @@ serial8250_verify_port(struct uart_port *port, struct serial_struct *ser)
 {
 	if (ser->irq >= nr_irqs || ser->irq < 0 ||
 	    ser->baud_base < 9600 || ser->type < PORT_UNKNOWN ||
-	    ser->type >= ARRAY_SIZE(uart_config) || ser->type == PORT_CIRRUS ||
+	    ser->type >= ARRAY_SIZE(serial8250_uart_config) || ser->type == PORT_CIRRUS ||
 	    ser->type == PORT_STARTECH)
 		return -EINVAL;
 	return 0;
@@ -3188,9 +3068,56 @@ static const char *serial8250_type(struct uart_port *port)
 {
 	int type = port->type;
 
-	if (type >= ARRAY_SIZE(uart_config))
+	if (type >= ARRAY_SIZE(serial8250_uart_config))
 		type = 0;
-	return uart_config[type].name;
+	return serial8250_uart_config[type].name;
+}
+
+static int serial8250_set_fifo_control(struct uart_port *port,
+                                const struct uart_fifo_control *ctl)
+{
+	struct uart_8250_port *up = container_of(port, struct uart_8250_port, port);
+	int ret = 0;
+
+	if (!ctl)
+		return -EINVAL;
+
+	if (!up->port.state)
+		return -ENODEV;
+
+	if (!(up->capabilities & UART_CAP_FIFO))
+		return -EOPNOTSUPP;
+	
+	ret = serial8250_dispatch_set_fifo_control(port, ctl);
+
+	/* Cache fifo_control, discard flush flags */
+	if (ret == 0) {
+		up->fifo_control = *ctl;
+		up->fifo_control.flags &=
+				~(UART_FIFO_CTRL_FLAG_FLUSH_RX | UART_FIFO_CTRL_FLAG_FLUSH_TX);
+	}
+
+	return ret;
+}
+
+static int serial8250_get_fifo_control(struct uart_port *port,
+                                struct uart_fifo_control *ctl)
+{
+	struct uart_8250_port *up = container_of(port, struct uart_8250_port, port);
+
+	if (!ctl)
+		return -EINVAL;
+
+	if (!up->port.state)
+		return -ENODEV;
+
+	if (!(up->capabilities & UART_CAP_FIFO))
+		return -EOPNOTSUPP;
+
+	memset(ctl, 0, sizeof(*ctl));
+	*ctl = up->fifo_control;
+	
+	return 0;
 }
 
 static const struct uart_ops serial8250_pops = {
@@ -3214,6 +3141,8 @@ static const struct uart_ops serial8250_pops = {
 	.request_port	= serial8250_request_port,
 	.config_port	= serial8250_config_port,
 	.verify_port	= serial8250_verify_port,
+	.set_fifo_control = serial8250_set_fifo_control,
+	.get_fifo_control = serial8250_get_fifo_control,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_get_char = serial8250_get_poll_char,
 	.poll_put_char = serial8250_put_poll_char,
@@ -3242,11 +3171,11 @@ void serial8250_set_defaults(struct uart_8250_port *up)
 		unsigned int type = up->port.type;
 
 		if (!up->port.fifosize)
-			up->port.fifosize = uart_config[type].fifo_size;
+			up->port.fifosize = serial8250_uart_config[type].fifo_size;
 		if (!up->tx_loadsz)
-			up->tx_loadsz = uart_config[type].tx_loadsz;
+			up->tx_loadsz = serial8250_uart_config[type].tx_loadsz;
 		if (!up->capabilities)
-			up->capabilities = uart_config[type].flags;
+			up->capabilities = serial8250_uart_config[type].flags;
 	}
 
 	set_io_from_upio(port);

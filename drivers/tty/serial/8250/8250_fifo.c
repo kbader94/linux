@@ -33,7 +33,33 @@ static __maybe_unused int fcr_to_rx_trig(struct uart_8250_port *up, u8 fcr)
 		: -EOPNOTSUPP;
 }
 
-int write_fcr_common(struct uart_8250_port *up, const struct uart_fifo_control *ctl, u8 fcr)
+static int tx_trig_to_fcr(struct uart_8250_port *up, u32 level)
+{
+	const struct serial8250_config *conf = 
+				 &serial8250_uart_config[up->port.type];
+
+	for (int i = 0; i < UART_FCR_T_TRIG_MAX_STATE; i++) {
+		if (conf->txtrig_bytes[i] && conf->txtrig_bytes[i] == level)
+			return UART_FCR_T_FROM_TRIG_I(i);
+	}
+
+	return -EINVAL;
+}
+
+static int __maybe_unused fcr_to_tx_trig(struct uart_8250_port *up, u8 fcr)
+{
+	const struct serial8250_config *conf = 
+				 &serial8250_uart_config[up->port.type];
+	int index = UART_FCR_T_TRIG_BITS(fcr);
+
+	if (index >= UART_FCR_T_TRIG_MAX_STATE)
+		return -EINVAL;
+
+	return conf->txtrig_bytes[index] ? conf->txtrig_bytes[index]
+		: -EOPNOTSUPP;
+}
+
+static int write_fcr_common(struct uart_8250_port *up, const struct uart_fifo_control *ctl, u8 fcr)
 {
 	unsigned long sl_flags;
 
@@ -55,10 +81,9 @@ int write_fcr_common(struct uart_8250_port *up, const struct uart_fifo_control *
 	return 0;
 }
 
-int port_16550A_set_fifo_control(struct uart_8250_port *up, 
+static int port_16550A_set_fifo_control(struct uart_8250_port *up, 
                                   const struct uart_fifo_control *ctl)
 {
-	u8 fcr = 0;
 	int fcr_rx_trig = 0;
 
 	/* Validate RX trigger level */
@@ -73,13 +98,29 @@ int port_16550A_set_fifo_control(struct uart_8250_port *up,
 	return write_fcr_common(up, ctl, fcr_rx_trig);
 }
 
+static int port_16650V2_set_fifo_control(struct uart_8250_port *up, 
+                                  const struct uart_fifo_control *ctl)
+{
+	int fcr_rx_trig, fcr_tx_trig = 0;
+
+	/* Validate RX trigger level */
+	fcr_rx_trig = rx_trig_to_fcr(up, ctl->rx_trigger_bytes);
+	if (fcr_rx_trig < 0)
+		return fcr_rx_trig;
+
+	/* Validate TX trigger level */
+	fcr_tx_trig = tx_trig_to_fcr(up, ctl->tx_trigger_bytes);
+	if (fcr_tx_trig < 0)
+		return fcr_tx_trig;
+
+	return write_fcr_common(up, ctl, fcr_rx_trig | fcr_tx_trig);
+}
+
 /* Use set fifo callback stored in uart_config[] */
 int serial8250_dispatch_set_fifo_control(struct uart_port *port,
                                 const struct uart_fifo_control *ctl)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
-	const struct serial8250_config *port_config = 
-				 &serial8250_uart_config[port->type];
 
 	if (!port || !ctl)
 		return -EINVAL;
@@ -88,6 +129,9 @@ int serial8250_dispatch_set_fifo_control(struct uart_port *port,
 		return -EOPNOTSUPP;
 
 	switch (port->type) {
+
+		case PORT_16650V2:
+			return port_16650V2_set_fifo_control(up, ctl);
 
 		case PORT_16550A:
 		default:

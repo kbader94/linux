@@ -117,8 +117,14 @@ const struct serial8250_config serial8250_uart_config[] = {
 		.tx_loadsz	= 64,
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10 |
 				  UART_FCR7_64BYTE,
-		.rxtrig_bytes	= {1, 16, 32, 56},
+		.rxtrig_bytes	= {1, 4, 8, 14, 1, 16, 32, 56},
 		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP | UART_CAP_AFE,
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_RX | 
+							  	UART_FIFO_CTRL_FLAG_ENABLE_TX  ,
+			.rx_trigger_bytes = 32,	
+			.tx_trigger_bytes = 32,			
+		}
 	},
 	[PORT_STARTECH] = {
 		.name		= "Startech",

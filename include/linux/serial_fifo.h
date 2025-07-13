@@ -11,6 +11,9 @@
 #define UART_FIFO_CTRL_FLAG_FLUSH_TX      (1 << 3)
 #define UART_FIFO_CTRL_FLAG_DMA_MODE      (1 << 4)
 
+/* TODO: refactor, remove rx enable(unused) and remove flush bits
+ * (Firstly it doesn't 'flush', and there's already a clear fifo method)
+ */
 struct uart_fifo_control {
 	__u64 flags;               /* Bitmask for enable/flush/options */
 	__u32 rx_trigger_bytes;    /* RX FIFO level */

@@ -136,6 +136,9 @@ int serial8250_dispatch_set_fifo_control(struct uart_port *port,
 		return -EOPNOTSUPP;
 
 	switch (port->type) {
+		case PORT_CH38X:
+			return port_16750_set_fifo_control(up, ctl);
+
 		case PORT_16750:
 			return port_16750_set_fifo_control(up, ctl);
 

@@ -126,6 +126,21 @@ const struct serial8250_config serial8250_uart_config[] = {
 			.tx_trigger_bytes = 32,			
 		}
 	},
+	[PORT_CH38X] = {
+		.name		= "CH382",
+		.fifo_size	= 256,
+		.tx_loadsz	= 256,
+		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10 |
+				  UART_FCR7_64BYTE,
+		.flags		= UART_CAP_FIFO | UART_CAP_EFR | UART_CAP_SLEEP,
+		.rxtrig_bytes			= {1, 4, 8, 14, 1, 32, 128, 224},
+		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP | UART_CAP_AFE,  
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_RX | 
+							  	UART_FIFO_CTRL_FLAG_ENABLE_TX  ,
+			.rx_trigger_bytes = 128,		
+		}
+	},
 	[PORT_STARTECH] = {
 		.name		= "Startech",
 		.fifo_size	= 1,

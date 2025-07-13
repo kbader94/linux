@@ -1905,7 +1905,7 @@ pci_wch_ch38x_setup(struct serial_private *priv,
 		    struct uart_8250_port *port, int idx)
 {
 	port->port.flags |= UPF_FIXED_TYPE;
-	port->port.type = PORT_16850;
+	port->port.type = PORT_CH38X;
 	return pci_default_setup(priv, board, port, idx);
 }
 

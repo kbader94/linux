@@ -41,6 +41,7 @@
 #include <linux/sizes.h>
 #include <linux/io.h>
 #include <linux/acpi.h>
+#include <linux/serial_fifo.h>
 
 #define UART_NR			14
 
@@ -83,6 +84,22 @@ enum {
 	REG_ARRAY_SIZE,
 };
 
+static const u32 pl011_ifls_rx_bits[] = {
+    UART011_IFLS_RX1_8,
+    UART011_IFLS_RX2_8,
+    UART011_IFLS_RX4_8,
+    UART011_IFLS_RX6_8,
+    UART011_IFLS_RX7_8,
+};
+
+static const u32 pl011_ifls_tx_bits[] = {
+    UART011_IFLS_TX7_8,
+    UART011_IFLS_TX6_8,
+    UART011_IFLS_TX4_8,
+    UART011_IFLS_TX2_8,
+    UART011_IFLS_TX1_8,
+};
+
 static u16 pl011_std_offsets[REG_ARRAY_SIZE] = {
 	[REG_DR] = UART01x_DR,
 	[REG_FR] = UART01x_FR,
@@ -108,12 +125,15 @@ struct vendor_data {
 	unsigned int		fr_cts;
 	unsigned int		fr_ri;
 	unsigned int		inv_fr;
+	unsigned char 		rx_trig_bytes[5];
+	unsigned char 		tx_trig_bytes[5];
 	bool			access_32b;
 	bool			oversampling;
 	bool			dma_threshold;
 	bool			cts_event_workaround;
 	bool			always_enabled;
 	bool			fixed_options;
+	struct uart_fifo_control 	fifo_control;
 
 	unsigned int (*get_fifosize)(struct amba_device *dev);
 };
@@ -130,6 +150,12 @@ static struct vendor_data vendor_arm = {
 	.fr_dsr			= UART01x_FR_DSR,
 	.fr_cts			= UART01x_FR_CTS,
 	.fr_ri			= UART011_FR_RI,
+	.rx_trig_bytes		= {4,8,16,24,28},
+	.tx_trig_bytes		= {28,24,16,8,4},
+	.fifo_control = {
+			.flags 			= UART_FIFO_CTRL_FLAG_ENABLE_FIFO  ,
+			.rx_trigger_bytes = 8	
+	},
 	.oversampling		= false,
 	.dma_threshold		= false,
 	.cts_event_workaround	= false,
@@ -204,6 +230,8 @@ static unsigned int get_fifosize_st(struct amba_device *dev)
 static struct vendor_data vendor_st = {
 	.reg_offset		= pl011_st_offsets,
 	.ifls			= UART011_IFLS_RX_HALF | UART011_IFLS_TX_HALF,
+	.rx_trig_bytes	= {8,16,32,48,56},
+	.tx_trig_bytes  = {56,48,32,16,8},
 	.fr_busy		= UART01x_FR_BUSY,
 	.fr_dsr			= UART01x_FR_DSR,
 	.fr_cts			= UART01x_FR_CTS,
@@ -273,6 +301,7 @@ struct uart_amba_port {
 	struct hrtimer		trigger_start_tx;
 	struct hrtimer		trigger_stop_tx;
 	bool			console_line_ended;
+	struct uart_fifo_control 		fifo_control;
 #ifdef CONFIG_DMA_ENGINE
 	/* DMA stuff */
 	unsigned int		dmacr;		/* dma control reg */
@@ -2143,8 +2172,11 @@ pl011_set_termios(struct uart_port *port, struct ktermios *termios,
 		if (termios->c_cflag & CMSPAR)
 			lcr_h |= UART011_LCRH_SPS;
 	}
-	if (uap->fifosize > 1)
+
+	if (uap->fifosize > 1 && (uap->vendor->fifo_control.flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO ))
 		lcr_h |= UART01x_LCRH_FEN;
+	else 
+		lcr_h &= ~UART01x_LCRH_FEN;
 
 	bits = tty_get_frame_size(termios->c_cflag);
 
@@ -2301,6 +2333,77 @@ static int pl011_rs485_config(struct uart_port *port, struct ktermios *termios,
 	return 0;
 }
 
+static int pl011_set_fifo_control(struct uart_port *port,
+                                const struct uart_fifo_control *ctl)
+{
+	struct uart_amba_port *uap = container_of(port, struct uart_amba_port, port);
+	u32 ifls = 0, lcr_h;
+	int txtbi = 0, rxtbi = 0;
+	int rx_level_count = 0, tx_level_count = 0;
+	unsigned long flags;
+	
+	rx_level_count = ARRAY_SIZE(uap->vendor->rx_trig_bytes);
+	tx_level_count = ARRAY_SIZE(uap->vendor->tx_trig_bytes);
+	
+	if (!uap->vendor->fifo_control.flags)
+		return -EOPNOTSUPP; /* Vendor does not support programmable FIFO */
+
+	if (ctl->rx_trigger_bytes > 0){
+		for (rxtbi = 0; rxtbi < rx_level_count; rxtbi++){
+			if (uap->vendor->rx_trig_bytes[rxtbi] == ctl->rx_trigger_bytes){
+				ifls |= pl011_ifls_rx_bits[rxtbi];
+				break;
+			}		
+		}
+		if (rxtbi == rx_level_count)
+			return -ERANGE; /* Vendor does not support specified FIFO level */
+	}
+
+    if (ctl->tx_trigger_bytes > 0){
+		for (txtbi = 0; txtbi < tx_level_count; txtbi++){
+			if (uap->vendor->tx_trig_bytes[txtbi] == ctl->tx_trigger_bytes){
+				ifls |= pl011_ifls_tx_bits[txtbi];
+				break;
+			}	
+		}
+		if (txtbi == tx_level_count)
+				return -ERANGE;	/* Vendor does not support specifiedFIFO level */
+	}
+
+	uart_port_lock_irqsave(port, &flags);
+
+	lcr_h = pl011_read(uap, REG_LCRH_TX);
+
+	if(ctl->flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO){
+		pl011_write(ifls, uap, REG_IFLS);
+		lcr_h |= UART01x_LCRH_FEN;
+	} else {
+		lcr_h &= ~UART01x_LCRH_FEN;
+	}
+
+	pl011_write_lcr_h(uap, lcr_h);
+
+	uap->fifo_control = *ctl;
+	
+	uart_port_unlock_irqrestore(port, flags);
+
+	return 0;
+}
+
+static int pl011_get_fifo_control(struct uart_port *port,
+                                struct uart_fifo_control *ctl)
+{
+	struct uart_amba_port *uap = container_of(port, struct uart_amba_port, port);
+
+	if (!uap->vendor->fifo_control.flags)
+		return -EOPNOTSUPP; /* No FIFO */
+
+	memset(ctl, 0, sizeof(*ctl));
+	*ctl = uap->fifo_control;
+	
+	return 0;
+}
+
 static const struct uart_ops amba_pl011_pops = {
 	.tx_empty	= pl011_tx_empty,
 	.set_mctrl	= pl011_set_mctrl,
@@ -2319,6 +2422,8 @@ static const struct uart_ops amba_pl011_pops = {
 	.type		= pl011_type,
 	.config_port	= pl011_config_port,
 	.verify_port	= pl011_verify_port,
+	.set_fifo_control = pl011_set_fifo_control,
+	.get_fifo_control = pl011_get_fifo_control,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_init     = pl011_hwinit,
 	.poll_get_char = pl011_get_poll_char,
@@ -2897,6 +3002,7 @@ static int pl011_probe(struct amba_device *dev, const struct amba_id *id)
 	uap->reg_offset = vendor->reg_offset;
 	uap->vendor = vendor;
 	uap->fifosize = vendor->get_fifosize(dev);
+	uap->fifo_control = vendor->fifo_control;
 	uap->port.iotype = vendor->access_32b ? UPIO_MEM32 : UPIO_MEM;
 	uap->port.irq = dev->irq[0];
 	uap->port.ops = &amba_pl011_pops;

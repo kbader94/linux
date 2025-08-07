@@ -14,6 +14,9 @@
 
 #include "../serial_mctrl_gpio.h"
 
+#define UART_8250_FCR_R_FROM_TRIG_I(i)	((i) << 6)
+#define UART_8250_FIFO_TRIG_MAX_STATE	4
+
 struct uart_8250_dma {
 	int (*tx_dma)(struct uart_8250_port *p);
 	int (*rx_dma)(struct uart_8250_port *p);
@@ -69,8 +72,12 @@ struct serial8250_config {
 	unsigned short	fifo_size;
 	unsigned short	tx_loadsz;
 	unsigned char	fcr;
-	unsigned char	rxtrig_bytes[UART_FCR_R_TRIG_MAX_STATE];
+	unsigned char	rxtrig_bytes[UART_8250_FIFO_TRIG_MAX_STATE];
+	unsigned char 	txtrig_bytes[UART_8250_FIFO_TRIG_MAX_STATE];
 	unsigned int	flags;
+	int (*set_fifo_control)
+				(struct uart_8250_port *up, const struct uart_fifo_control *ctl);
+	struct uart_fifo_control fifo_control;
 };
 
 #define UART_CAP_FIFO	BIT(8)	/* UART has FIFO */

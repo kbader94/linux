@@ -155,6 +155,7 @@ struct uart_8250_port {
 
 	struct uart_8250_dma	*dma;
 	const struct uart_8250_ops *ops;
+	struct uart_fifo_control	fifo_control;
 
 	/* 8250 specific callbacks */
 	u32			(*dl_read)(struct uart_8250_port *up);

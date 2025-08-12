@@ -330,8 +330,12 @@ static int rx_trig_to_fcr(struct uart_8250_port *up, u32 level)
 	conf = &uart_config[up->port.type];
 
 	for (int i = 0; i < UART_FCR_R_TRIG_MAX_STATE; i++) {
-		if (conf->rxtrig_bytes[i] && conf->rxtrig_bytes[i] == level)
-			return UART_FCR_R_FROM_TRIG_I(i);
+		if (conf->rxtrig_bytes[i] && conf->rxtrig_bytes[i] == level) {
+			if (i >= 4)
+				return UART_FCR7_64BYTE | UART_FCR_R_FROM_TRIG_I(i - 4); /* 16750 mode */
+			else /* 16550A/16650 mode */
+				return UART_FCR_R_FROM_TRIG_I(i);
+		}
 	}
 
 	return -EINVAL;
@@ -366,6 +370,35 @@ static int write_fcr_common(struct uart_8250_port *up, const struct uart_fifo_co
 
 	uart_port_unlock_irqrestore(&up->port, flags);
 	return 0;
+}
+
+static int port_16750_set_fifo_control(struct uart_8250_port *up, 
+								  const struct uart_fifo_control *ctl)
+{
+	int ret, fcr_rx_trig = 0;
+	u8 lcr = 0;
+
+	fcr_rx_trig = rx_trig_to_fcr(up, ctl->rx_trigger_bytes);
+	if (fcr_rx_trig < 0)
+		return fcr_rx_trig;
+
+	if (ctl->tx_trigger_bytes) 
+		return -EOPNOTSUPP; /* TX trigger levels unavail on 16750 */
+
+	/* set DLAB LCR[7] */
+	if (fcr_rx_trig & UART_FCR7_64BYTE) {
+		lcr = serial_in(up, UART_LCR);
+		serial_out(up, UART_LCR, lcr | UART_LCR_DLAB);
+	}
+
+	ret = write_fcr_common(up, ctl, fcr_rx_trig);
+
+	/* unset DLAB LCR[7] */
+	if (fcr_rx_trig & UART_FCR7_64BYTE) {
+		serial_out(up, UART_LCR, lcr);
+	}
+
+	return ret;
 }
 
 static int port_16650V2_set_fifo_control(struct uart_8250_port *up, 
@@ -421,6 +454,8 @@ static int serial8250_dispatch_set_fifo_control(struct uart_port *port,
 
 	switch (port->type) {
 
+		case PORT_16750:
+			return port_16750_set_fifo_control(up, ctl);	
 		case PORT_16650V2:
 			return port_16650V2_set_fifo_control(up, ctl);
 		case PORT_16550A:

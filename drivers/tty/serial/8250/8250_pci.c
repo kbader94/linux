@@ -1926,7 +1926,7 @@ pci_wch_ch38x_setup(struct serial_private *priv,
 		return serial_8250_warn_need_ioport(priv->dev);
 
 	port->port.flags |= UPF_FIXED_TYPE;
-	port->port.type = PORT_16850;
+	port->port.type = PORT_CH38X;
 	return pci_default_setup(priv, board, port, idx);
 }
 

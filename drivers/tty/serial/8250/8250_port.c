@@ -110,6 +110,20 @@ static const struct serial8250_config uart_config[] = {
 		.rxtrig_bytes	= {1, 16, 32, 56},
 		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP | UART_CAP_AFE,
 	},
+	[PORT_CH38X] = {
+		.name		= "CH38X",
+		.fifo_size	= 256,
+		.tx_loadsz	= 256,
+		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_10 |
+				  UART_FCR7_64BYTE,
+		.flags		= UART_CAP_FIFO | UART_CAP_EFR | UART_CAP_SLEEP,
+		.rxtrig_bytes			= {1, 4, 8, 14, 1, 32, 128, 224},
+		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP | UART_CAP_AFE,  
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_FIFO,
+			.rx_trigger_bytes = 128,		
+		}
+	},
 	[PORT_STARTECH] = {
 		.name		= "Startech",
 		.fifo_size	= 1,
@@ -514,6 +528,7 @@ static int serial8250_dispatch_set_fifo_control(struct uart_port *port,
 	
 		case PORT_16C950:
 			return port_16C950_set_fifo_control(up, ctl);
+		case PORT_CH38X:
 		case PORT_16750:
 			return port_16750_set_fifo_control(up, ctl);	
 		case PORT_16650V2:

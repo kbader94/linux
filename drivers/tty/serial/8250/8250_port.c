@@ -42,15 +42,19 @@ static const struct serial8250_config uart_config[];
 
 static int rx_trig_to_fcr(struct uart_8250_port *up, u32 level)
 {
-	const struct serial8250_config *conf;
-	conf = &uart_config[up->port.type];
+	const struct serial8250_config *conf = &uart_config[up->port.type];
 
 	for (int i = 0; i < UART_8250_FIFO_TRIG_MAX_STATE; i++) {
 		if (conf->rxtrig_bytes[i] && conf->rxtrig_bytes[i] == level) {
-			if (i >= 4) /* 16750 mode */
-				return UART_FCR7_64BYTE | UART_8250_FCR_R_FROM_TRIG_I(i - 4); 
-			else /* 16550A/16650 mode */
-				return UART_8250_FCR_R_FROM_TRIG_I(i);
+			const bool want_ext = (i >= 4);	/* 16750-style states */
+			u8 ext_mode_bit = want_ext ? UART_FCR7_64BYTE : 0;
+
+			/* CH38x quirk: FCR[5] meaning inverted */
+			if (up->bugs & UART_BUG_FCR5_EXT_MODE_INVERT)
+				ext_mode_bit ^= UART_FCR7_64BYTE;
+
+			/* Set FCR7 if uart_config has more that 4 rxtrig_bytes */
+			return UART_8250_FCR_R_FROM_TRIG_I(want_ext ? (i - 4) : i) | ext_mode_bit;
 		}
 	}
 
@@ -141,17 +145,13 @@ static int port_16750_set_fifo_control(struct uart_8250_port *up,
 		return -EOPNOTSUPP; /* TX trigger levels unavail on 16750 */
 
 	/* Access to FCR[5] requires LCR[7] = 1 */
-	if (fcr_rx_trig & UART_FCR7_64BYTE) {
-		lcr = serial_in(up, UART_LCR);
-		serial_out(up, UART_LCR, lcr | UART_LCR_DLAB);
-	}
+	lcr = serial_in(up, UART_LCR);
+	serial_out(up, UART_LCR, lcr | UART_LCR_DLAB);
 
 	ret = write_fcr_common(up, ctl, fcr_rx_trig);
 
 	/* unset LCR[7] */
-	if (fcr_rx_trig & UART_FCR7_64BYTE) {
-		serial_out(up, UART_LCR, lcr);
-	}
+	serial_out(up, UART_LCR, lcr);
 
 	return ret;
 }
@@ -279,6 +279,19 @@ static const struct serial8250_config uart_config[] = {
 			.rx_trigger_bytes = 14,
 		},
 		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP | UART_CAP_AFE,
+		.set_fifo_control = port_16750_set_fifo_control,
+	},
+	[PORT_CH38X] = {
+		.name		= "CH38X",
+		.fifo_size	= 256,
+		.tx_loadsz	= 256,
+		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_11,
+		.flags		= UART_CAP_FIFO | UART_CAP_EFR | UART_CAP_SLEEP,
+		.rxtrig_bytes			= {1, 4, 8, 14, 1, 32, 128, 224},
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_FIFO,
+			.rx_trigger_bytes = 14,
+		},
 		.set_fifo_control = port_16750_set_fifo_control,
 	},
 	[PORT_STARTECH] = {

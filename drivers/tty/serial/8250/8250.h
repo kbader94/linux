@@ -100,6 +100,7 @@ struct serial8250_config {
 #define UART_BUG_NOMSR	BIT(2)	/* UART has buggy MSR status bits (Au1x00) */
 #define UART_BUG_THRE	BIT(3)	/* UART has buggy THRE reassertion */
 #define UART_BUG_TXRACE	BIT(5)	/* UART Tx fails to set remote DR */
+#define UART_BUG_FCR5_EXT_MODE_INVERT    BIT(6)  /* UART has FCR[5] meaning inverted */
 
 /* Module parameters */
 #define UART_NR	CONFIG_SERIAL_8250_NR_UARTS

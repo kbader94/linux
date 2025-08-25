@@ -90,6 +90,7 @@ struct serial8250_config {
 					 * STOP PARITY EPAR SPAR WLEN5 WLEN6
 					 */
 #define UART_CAP_NOTEMT	BIT(18)	/* UART without interrupt on TEMT available */
+#define UART_CAP_ARB_TRIG	BIT(19)	/* UART supports arbitrary trigger levels */
 
 #define UART_BUG_QUOT	BIT(0)	/* UART has buggy quot LSB */
 #define UART_BUG_TXEN	BIT(1)	/* UART has buggy TX IIR status */

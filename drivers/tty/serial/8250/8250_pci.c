@@ -2126,6 +2126,17 @@ pci_moxa_setup(struct serial_private *priv,
 	return setup_port(priv, port, bar, offset, 0);
 }
 
+static int
+pci_asix_ax99100_setup(struct serial_private *priv,
+                       const struct pciserial_board *board,
+                       struct uart_8250_port *port, int idx)
+{
+    port->port.flags |= UPF_FIXED_TYPE;
+    port->port.type = PORT_16C950;
+
+    return pci_default_setup(priv, board, port, idx);
+}
+
 /*
  * Master list of serial port init/setup/exit quirks.
  * This does not describe the general nature of the port.
@@ -2976,7 +2987,17 @@ static struct pci_serial_quirk pci_serial_quirks[] = {
 		.setup		= pci_fintek_f815xxa_setup,
 		.init		= pci_fintek_f815xxa_init,
 	},
-
+	/*
+	 * ASIX PCI serial boards
+	 */
+	{
+	.vendor     = PCI_VENDOR_ID_ASIX,
+	.device     = PCI_DEVICE_ID_ASIX_AX99100,
+	.subvendor  = PCI_ANY_ID,
+	.subdevice  = PCI_ANY_ID,
+	.setup      = pci_asix_ax99100_setup,
+	},
+	
 	/*
 	 * Default "match everything" terminator entry
 	 */

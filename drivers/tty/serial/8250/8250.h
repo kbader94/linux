@@ -14,6 +14,7 @@
 
 #include "../serial_mctrl_gpio.h"
 
+#define UART_8250_FCR_T_FROM_TRIG_I(i)	((i) << 4)
 #define UART_8250_FCR_R_FROM_TRIG_I(i)	((i) << 6)
 #define UART_8250_FIFO_TRIG_MAX_STATE	4
 

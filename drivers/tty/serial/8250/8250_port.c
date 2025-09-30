@@ -53,6 +53,19 @@ static int rx_trig_to_fcr(struct uart_8250_port *up, u32 level)
 	return -EINVAL;
 }
 
+static int tx_trig_to_fcr(struct uart_8250_port *up, u32 level)
+{
+	const struct serial8250_config *conf;
+	conf = &uart_config[up->port.type];
+
+	for (int i = 0; i < UART_8250_FIFO_TRIG_MAX_STATE; i++) {
+		if (conf->txtrig_bytes[i] && conf->txtrig_bytes[i] == level)
+			return UART_8250_FCR_T_FROM_TRIG_I(i);
+	}
+
+	return -EINVAL;
+}
+
 /*
  * Search a per-part trigger-level table for the best match per @round:
  *   ROUND_EXACT - the entry equals @want, else -ERANGE
@@ -126,6 +139,53 @@ static int write_fcr_common(struct uart_8250_port *up,
 	up->fcr = fcr;
 
 	return 0;
+}
+
+static int port_16650V2_set_fifo_control(struct uart_8250_port *up,
+					 struct uart_fifo_control *ctl,
+					 enum uart_fifo_round round)
+{
+	const struct serial8250_config *cfg = &uart_config[up->port.type];
+	u32 rounded_rx = ctl->rx_trigger_bytes;
+	u32 rounded_tx = ctl->tx_trigger_bytes;
+	int fcr_rx_trig, fcr_tx_trig, ret;
+	u8 save_lcr, efr;
+
+	/* Enable EFR[4] - Required to set Tx FIFO level */
+	save_lcr = serial_in(up, UART_LCR);
+	/* Must set LCR = 0xBF to enable EFR[4] */
+	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B); /* LCR = 0xBF */
+	efr = serial_in(up, UART_EFR);
+	serial_out(up, UART_EFR, efr | UART_EFR_ECB);
+	serial_out(up, UART_LCR, save_lcr);
+
+	ret = serial8250_round_trig(cfg->rxtrig_bytes,
+				    UART_8250_FIFO_TRIG_MAX_STATE,
+				    rounded_rx, round, &rounded_rx);
+	if (ret)
+		return ret;
+	ctl->rx_trigger_bytes = rounded_rx;
+
+	ret = serial8250_round_trig(cfg->txtrig_bytes,
+				    UART_8250_FIFO_TRIG_MAX_STATE,
+				    rounded_tx, round, &rounded_tx);
+	if (ret)
+		return ret;
+	ctl->tx_trigger_bytes = rounded_tx;
+
+	fcr_rx_trig = rx_trig_to_fcr(up, rounded_rx);
+	if (fcr_rx_trig < 0)
+		return fcr_rx_trig;
+
+	fcr_tx_trig = tx_trig_to_fcr(up, rounded_tx);
+	if (fcr_tx_trig < 0)
+		return fcr_tx_trig;
+
+	/* 'DMA' mode is required for programmable FIFO levels.
+	 * Note: DMA is a legacy term here and does NOT mean Direct Memory Access
+	 * See section 2.5 of ST16C650A datasheet
+	 */
+	return write_fcr_common(up, ctl, fcr_rx_trig | fcr_tx_trig | UART_FCR_DMA_SELECT);
 }
 
 static int port_16550A_set_fifo_control(struct uart_8250_port *up,
@@ -209,7 +269,14 @@ static const struct serial8250_config uart_config[] = {
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01 |
 				  UART_FCR_T_TRIG_00,
 		.rxtrig_bytes	= {8, 16, 24, 28},
+		.txtrig_bytes	= {16, 8, 24, 30},
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_FIFO,
+			.rx_trigger_bytes = 16,
+			.tx_trigger_bytes = 16,
+		},
 		.flags		= UART_CAP_FIFO | UART_CAP_EFR | UART_CAP_SLEEP,
+		.set_fifo_control = port_16650V2_set_fifo_control,
 	},
 	[PORT_16750] = {
 		.name		= "TI16750",

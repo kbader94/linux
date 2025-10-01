@@ -84,6 +84,49 @@ static int write_fcr_common(struct uart_8250_port *up,
 	return 0;
 }
 
+static int port_16C950_set_fifo_control(struct uart_8250_port *up,
+                                  const struct uart_fifo_control *ctl)
+{
+	unsigned long flags;
+	u8 ier, lcr, rtl, ttl, fcr;
+	u8 rx = clamp_val(ctl->rx_trigger_bytes, 1, 127); 
+	u8 tx = clamp_val(ctl->tx_trigger_bytes, 0, 127); 
+
+	/* Set FCR: Enable FIFO */
+	fcr = UART_FCR_DMA_SELECT;
+	if (ctl->flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO)
+		fcr |= UART_FCR_ENABLE_FIFO;
+	serial_out(up, UART_FCR, fcr);
+	up->fcr = fcr;
+
+	/* Set EFR[4]: Enhanced mode */
+	lcr = serial_in(up, UART_LCR);
+	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);          /* 0xBF */
+	serial_out(up, UART_EFR, serial_in(up, UART_EFR) | UART_EFR_ECB);
+	serial_out(up, UART_LCR, lcr);
+
+	/* Set ACR[5]: 950 mode trigger levels enable */
+	up->acr = (up->acr | UART_ACR_TLENB) & ~UART_ACR_ICRRD;
+	serial_icr_write(up, UART_ACR, up->acr);
+
+	/* Write arbitrary trigger levels */
+	serial_icr_write(up, UART_TTL, tx);
+	serial_icr_write(up, UART_RTL, rx);
+
+	/* Verify */
+	ttl = serial_icr_read(up, UART_TTL);
+	rtl = serial_icr_read(up, UART_RTL);
+	if (tx != ttl || rx != rtl) {
+		/* Restore IER and unlock before returning */
+		serial_out(up, UART_IER, ier);
+		spin_unlock_irqrestore(&up->port.lock, flags);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+
 static int port_16750_set_fifo_control(struct uart_8250_port *up, 
 								  const struct uart_fifo_control *ctl)
 {
@@ -249,8 +292,15 @@ static const struct serial8250_config uart_config[] = {
 		.tx_loadsz	= 128,
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01,
 		.rxtrig_bytes	= {16, 32, 112, 120},
+		.txtrig_bytes	= {16, 32, 64, 112},
+		.fifo_control = {
+			.flags 			  = UART_FIFO_CTRL_FLAG_ENABLE_FIFO,
+			.rx_trigger_bytes = 32,
+			.tx_trigger_bytes = 16,
+		},
 		/* UART_CAP_EFR breaks billionon CF bluetooth card. */
 		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP,
+		.set_fifo_control = port_16C950_set_fifo_control,
 	},
 	[PORT_16654] = {
 		.name		= "ST16654",

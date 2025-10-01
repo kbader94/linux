@@ -75,6 +75,8 @@ struct serial8250_config {
 	unsigned char	fcr;
 	unsigned char	rxtrig_bytes[UART_8250_FIFO_TRIG_MAX_STATE];
 	unsigned char 	txtrig_bytes[UART_8250_FIFO_TRIG_MAX_STATE];
+	unsigned char 	rxtrig_max;
+	unsigned char	txtrig_max;
 	unsigned int	flags;
 	int (*set_fifo_control)
 				(struct uart_8250_port *up,
@@ -96,6 +98,7 @@ struct serial8250_config {
 					 * STOP PARITY EPAR SPAR WLEN5 WLEN6
 					 */
 #define UART_CAP_NOTEMT	BIT(18)	/* UART without interrupt on TEMT available */
+#define UART_CAP_ARBTRG BIT(19) /* UART supports arbitrary FIFO trigger levels */
 
 #define UART_BUG_QUOT	BIT(0)	/* UART has buggy quot LSB */
 #define UART_BUG_TXEN	BIT(1)	/* UART has buggy TX IIR status */

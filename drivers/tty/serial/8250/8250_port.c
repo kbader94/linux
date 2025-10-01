@@ -145,6 +145,95 @@ static int write_fcr_common(struct uart_8250_port *up,
 	return 0;
 }
 
+static int port_16C950_set_fifo_control(struct uart_8250_port *up,
+					struct uart_fifo_control *ctl,
+					enum uart_fifo_round round)
+{
+	const struct serial8250_config *cfg = &uart_config[up->port.type];
+	u32 rx_max = cfg->rxtrig_max;
+	u32 tx_max = cfg->txtrig_max;
+	u8 ier, lcr, rtl, ttl, fcr;
+	u32 rx = ctl->rx_trigger_bytes;
+	u32 tx = ctl->tx_trigger_bytes;
+
+	/*
+	 * 16C950 supports continuous trigger levels (rx in 1..rx_max, tx
+	 * in 0..tx_max). The maxes are part-specific (Oxford OX16C950:
+	 * rx 1..127, tx 0..63) and read from uart_config[port->type] so
+	 * 16C950-compatible parts with different RTL/TTL register widths
+	 * (or different fifosize-derived caps) can be supported without
+	 * touching this function. Honour @round for out-of-range requests
+	 * instead of the always-clamp behaviour of the original
+	 * implementation.
+	 */
+	switch (round) {
+	case UART_FIFO_ROUND_EXACT:
+		if (rx < 1 || rx > rx_max || tx > tx_max)
+			return -ERANGE;
+		break;
+	case UART_FIFO_ROUND_DOWN:
+		if (rx < 1)
+			return -ERANGE;
+		if (rx > rx_max)
+			rx = rx_max;
+		if (tx > tx_max)
+			tx = tx_max;
+		break;
+	case UART_FIFO_ROUND_UP:
+		if (rx < 1)
+			rx = 1;
+		if (rx > rx_max || tx > tx_max)
+			return -ERANGE;
+		break;
+	}
+	ctl->rx_trigger_bytes = rx;
+	ctl->tx_trigger_bytes = tx;
+
+	/*
+	 * OX16C950 enhanced-mode register access (LCR=0xBF for EFR, and the
+	 * SCR/ICR indirect protocol for ACR/TTL/RTL) re-maps register offsets
+	 * and can cause spurious threshold interrupts on TTL/RTL writes.
+	 * Save IER, mask all interrupts for the duration, and restore on the
+	 * way out. The dispatcher already holds &up->port.lock.
+	 */
+	ier = serial_in(up, UART_IER);
+	serial_out(up, UART_IER, 0);
+
+	/* Set FCR: Enable FIFO */
+	fcr = UART_FCR_DMA_SELECT;
+	if (ctl->flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO)
+		fcr |= UART_FCR_ENABLE_FIFO;
+	serial_out(up, UART_FCR, fcr);
+	up->fcr = fcr;
+
+	/* Set EFR[4]: Enhanced mode */
+	lcr = serial_in(up, UART_LCR);
+	serial_out(up, UART_LCR, UART_LCR_CONF_MODE_B);          /* 0xBF */
+	serial_out(up, UART_EFR, serial_in(up, UART_EFR) | UART_EFR_ECB);
+	serial_out(up, UART_LCR, lcr);
+
+	/* Set ACR[5]: 950 mode trigger levels enable */
+	up->acr = (up->acr | UART_ACR_TLENB) & ~UART_ACR_ICRRD;
+	serial_icr_write(up, UART_ACR, up->acr);
+
+	/* Write arbitrary trigger levels */
+	serial_icr_write(up, UART_TTL, tx);
+	serial_icr_write(up, UART_RTL, rx);
+
+	/* Verify */
+	ttl = serial_icr_read(up, UART_TTL);
+	rtl = serial_icr_read(up, UART_RTL);
+
+	/* Restore IER before returning, regardless of verify outcome. */
+	serial_out(up, UART_IER, ier);
+
+	if (tx != ttl || rx != rtl)
+		return -EINVAL;
+
+	return 0;
+}
+
+
 static int port_16750_set_fifo_control(struct uart_8250_port *up,
 				       struct uart_fifo_control *ctl,
 				       enum uart_fifo_round round)
@@ -346,9 +435,21 @@ static const struct serial8250_config uart_config[] = {
 		.fifo_size	= 128,
 		.tx_loadsz	= 128,
 		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01,
-		.rxtrig_bytes	= {16, 32, 112, 120},
-		/* UART_CAP_EFR breaks billionon CF bluetooth card. */
-		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP,
+		.rxtrig_max	= 127,
+		.txtrig_max	= 127,
+		.fifo_control = {
+			.flags 		  = UART_FIFO_CTRL_FLAG_ENABLE_FIFO,
+			.rx_trigger_bytes = 32,
+			.tx_trigger_bytes = 16,
+		},
+		/*
+		 * UART_CAP_EFR breaks billionon CF bluetooth card
+		 * BUT that should be fixed elsewhere without potentially
+		 * reducing throughput of every other 16950 device
+		 */
+		.flags		= UART_CAP_FIFO | UART_CAP_SLEEP |
+				  UART_CAP_ARBTRG | UART_CAP_EFR,
+		.set_fifo_control = port_16C950_set_fifo_control,
 	},
 	[PORT_16654] = {
 		.name		= "ST16654",

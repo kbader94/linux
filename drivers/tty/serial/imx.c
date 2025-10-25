@@ -236,6 +236,7 @@ struct imx_port {
 	struct hrtimer		trigger_start_tx;
 	struct hrtimer		trigger_stop_tx;
 	unsigned int		rxtl;
+	unsigned int 		txtl;
 };
 
 struct imx_port_ucrs {
@@ -1341,8 +1342,6 @@ static void imx_uart_clear_rx_errors(struct imx_port *sport)
 #define TXTL_DEFAULT 8
 #define RXTL_DEFAULT 8 /* 8 characters or aging timer */
 #define RXTL_CONSOLE_DEFAULT 1
-#define TXTL_DMA 8 /* DMA burst setting */
-#define RXTL_DMA 9 /* DMA burst setting */
 
 static void imx_uart_setup_ufcr(struct imx_port *sport,
 				unsigned char txwl, unsigned char rxwl)
@@ -1353,6 +1352,94 @@ static void imx_uart_setup_ufcr(struct imx_port *sport,
 	val = imx_uart_readl(sport, UFCR) & (UFCR_RFDIV | UFCR_DCEDTE);
 	val |= txwl << UFCR_TXTL_SHF | rxwl;
 	imx_uart_writel(sport, val, UFCR);
+}
+
+static int imx_set_fifo_control(struct uart_port *port,
+				const struct uart_fifo_control *ctl,
+				enum uart_fifo_round round)
+{
+	struct dma_slave_config slave_config = {};
+	struct imx_port *sport = to_imx_port(port);
+	struct device *dev = sport->port.dev;
+	u32 txwl = ctl->tx_trigger_bytes;
+	u32 rxwl = ctl->rx_trigger_bytes;
+	u32 fifosize = port->fifosize;
+	unsigned long flags;
+	unsigned int rx_maxburst;
+
+	if (!(ctl->flags & UART_FIFO_CTRL_FLAG_ENABLE_FIFO))
+		return -EOPNOTSUPP; /* IMX does not support disabling FIFO */
+
+	/*
+	 * i.MX accepts any trigger level in 1..fifosize; @round only governs
+	 * how out-of-range requests are handled. The sysfs path already
+	 * clamps to fifosize, so for typical callers this is a no-op.
+	 */
+	switch (round) {
+	case UART_FIFO_ROUND_EXACT:
+		if (rxwl < 1 || rxwl > fifosize ||
+		    txwl < 1 || txwl > fifosize)
+			return -ERANGE;
+		break;
+	case UART_FIFO_ROUND_DOWN:
+		if (rxwl < 1 || txwl < 1)
+			return -ERANGE;
+		if (rxwl > fifosize)
+			rxwl = fifosize;
+		if (txwl > fifosize)
+			txwl = fifosize;
+		break;
+	case UART_FIFO_ROUND_UP:
+		if (rxwl > fifosize || txwl > fifosize)
+			return -ERANGE;
+		if (rxwl < 1)
+			rxwl = 1;
+		if (txwl < 1)
+			txwl = 1;
+		break;
+	}
+
+	uart_port_lock_irqsave(&sport->port, &flags);
+	imx_uart_setup_ufcr(sport, txwl, rxwl);
+	sport->rxtl = rxwl;
+	sport->txtl = txwl;
+	uart_port_unlock_irqrestore(&sport->port, flags);
+
+	if (sport->dma_is_enabled){
+
+		/* reconfig dma rx */
+		slave_config.direction = DMA_DEV_TO_MEM;
+		slave_config.src_addr = sport->port.mapbase + URXD0;
+		slave_config.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+		/* one byte less than the watermark level to enable the aging timer */
+		rx_maxburst = max_t(u32, rxwl - 1, 1);
+		slave_config.src_maxburst = rx_maxburst;
+		if (dmaengine_slave_config(sport->dma_chan_rx, &slave_config))
+			dev_err(dev, "error in RX dma configuration.\n");
+
+		/* reconfig dma tx */
+		slave_config.direction = DMA_MEM_TO_DEV;
+		slave_config.dst_addr = sport->port.mapbase + URTX0;
+		slave_config.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+		slave_config.dst_maxburst = txwl;
+		if (dmaengine_slave_config(sport->dma_chan_tx, &slave_config))
+			dev_err(dev, "error in TX dma configuration.");
+
+	}
+
+	return 0;
+}
+
+static int imx_get_fifo_control(struct uart_port *port,
+				struct uart_fifo_control *ctl)
+{
+	struct imx_port *sport = to_imx_port(port);
+
+	ctl->rx_trigger_bytes = sport->rxtl;
+	ctl->tx_trigger_bytes = sport->txtl;
+	ctl->flags = UART_FIFO_CTRL_FLAG_ENABLE_FIFO;
+
+	return 0;
 }
 
 static void imx_uart_dma_exit(struct imx_port *sport)
@@ -1394,7 +1481,7 @@ static int imx_uart_dma_init(struct imx_port *sport)
 	slave_config.src_addr = sport->port.mapbase + URXD0;
 	slave_config.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
 	/* one byte less than the watermark level to enable the aging timer */
-	slave_config.src_maxburst = RXTL_DMA - 1;
+	slave_config.src_maxburst = sport->rxtl - 1;
 	ret = dmaengine_slave_config(sport->dma_chan_rx, &slave_config);
 	if (ret) {
 		dev_err(dev, "error in RX dma configuration.\n");
@@ -1422,7 +1509,7 @@ static int imx_uart_dma_init(struct imx_port *sport)
 	slave_config.direction = DMA_MEM_TO_DEV;
 	slave_config.dst_addr = sport->port.mapbase + URTX0;
 	slave_config.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
-	slave_config.dst_maxburst = TXTL_DMA;
+	slave_config.dst_maxburst = sport->txtl;
 	ret = dmaengine_slave_config(sport->dma_chan_tx, &slave_config);
 	if (ret) {
 		dev_err(dev, "error in TX dma configuration.");
@@ -1440,8 +1527,6 @@ static void imx_uart_enable_dma(struct imx_port *sport)
 {
 	u32 ucr1;
 
-	imx_uart_setup_ufcr(sport, TXTL_DMA, RXTL_DMA);
-
 	/* set UCR1 */
 	ucr1 = imx_uart_readl(sport, UCR1);
 	ucr1 |= UCR1_RXDMAEN | UCR1_TXDMAEN | UCR1_ATDMAEN;
@@ -1458,8 +1543,6 @@ static void imx_uart_disable_dma(struct imx_port *sport)
 	ucr1 = imx_uart_readl(sport, UCR1);
 	ucr1 &= ~(UCR1_RXDMAEN | UCR1_TXDMAEN | UCR1_ATDMAEN);
 	imx_uart_writel(sport, ucr1, UCR1);
-
-	imx_uart_setup_ufcr(sport, TXTL_DEFAULT, sport->rxtl);
 
 	sport->dma_is_enabled = 0;
 }
@@ -1486,10 +1569,8 @@ static int imx_uart_startup(struct uart_port *port)
 
 	if (uart_console(&sport->port))
 		sport->rxtl = RXTL_CONSOLE_DEFAULT;
-	else
-		sport->rxtl = RXTL_DEFAULT;
 
-	imx_uart_setup_ufcr(sport, TXTL_DEFAULT, sport->rxtl);
+	imx_uart_setup_ufcr(sport, sport->txtl, sport->rxtl);
 
 	/* disable the DREN bit (Data Ready interrupt enable) before
 	 * requesting IRQs
@@ -1955,7 +2036,7 @@ static int imx_uart_poll_init(struct uart_port *port)
 	if (retval)
 		clk_disable_unprepare(sport->clk_ipg);
 
-	imx_uart_setup_ufcr(sport, TXTL_DEFAULT, sport->rxtl);
+	imx_uart_setup_ufcr(sport, sport->txtl, sport->rxtl);
 
 	uart_port_lock_irqsave(&sport->port, &flags);
 
@@ -2047,7 +2128,7 @@ static int imx_uart_rs485_config(struct uart_port *port, struct ktermios *termio
 		/* If the receiver trigger is 0, set it to a default value */
 		ufcr = imx_uart_readl(sport, UFCR);
 		if ((ufcr & UFCR_RXTL_MASK) == 0)
-			imx_uart_setup_ufcr(sport, TXTL_DEFAULT, sport->rxtl);
+			imx_uart_setup_ufcr(sport, sport->txtl, sport->rxtl);
 		imx_uart_start_rx(port);
 	}
 
@@ -2068,6 +2149,8 @@ static const struct uart_ops imx_uart_pops = {
 	.flush_buffer	= imx_uart_flush_buffer,
 	.set_termios	= imx_uart_set_termios,
 	.type		= imx_uart_type,
+	.get_fifo_control	= imx_get_fifo_control,
+	.set_fifo_control	= imx_set_fifo_control,
 	.config_port	= imx_uart_config_port,
 	.verify_port	= imx_uart_verify_port,
 #if defined(CONFIG_CONSOLE_POLL)
@@ -2309,7 +2392,7 @@ imx_uart_console_setup(struct console *co, char *options)
 	else
 		imx_uart_console_get_options(sport, &baud, &parity, &bits);
 
-	imx_uart_setup_ufcr(sport, TXTL_DEFAULT, sport->rxtl);
+	imx_uart_setup_ufcr(sport, sport->txtl, sport->rxtl);
 
 	retval = uart_set_options(&sport->port, co, baud, parity, bits, flow);
 
@@ -2471,6 +2554,8 @@ static int imx_uart_probe(struct platform_device *pdev)
 	sport->port.iotype = UPIO_MEM;
 	sport->port.irq = rxirq;
 	sport->port.fifosize = 32;
+	sport->rxtl = RXTL_DEFAULT;
+	sport->txtl = TXTL_DEFAULT;
 	sport->port.has_sysrq = IS_ENABLED(CONFIG_SERIAL_IMX_CONSOLE);
 	sport->port.ops = &imx_uart_pops;
 	sport->port.rs485_config = imx_uart_rs485_config;

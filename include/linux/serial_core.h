@@ -368,6 +368,51 @@ enum uart_fifo_round {
  *	Locking: none.
  *	Interrupts: caller dependent.
  *
+ * @set_fifo_control: ``int ()(struct uart_port *port,
+ *                             const struct uart_fifo_control *ctl,
+ *                             enum uart_fifo_round round)``
+ *
+ *	Program the UART FIFO enable/disable and RX/TX trigger levels. The
+ *	callback is responsible for taking the port spin lock itself when
+ *	touching registers.
+ *
+ *	@round selects how a request that is not exactly supported by the
+ *	part is handled (see &enum uart_fifo_round): the rx_trig_bytes /
+ *	tx_trig_bytes sysfs writes pass %UART_FIFO_ROUND_DOWN to preserve
+ *	the legacy "round to the next supported trigger" behaviour;
+ *	fifo_enable passes %UART_FIFO_ROUND_EXACT because the cached trigger
+ *	levels were already supported; in-kernel callers (e.g. a line
+ *	discipline configuring LIN break-detect timing) may pass
+ *	%UART_FIFO_ROUND_EXACT to demand a specific level or
+ *	%UART_FIFO_ROUND_UP to request "at least this much buffering".
+ *
+ *	Return: 0 on success;
+ *		-EOPNOTSUPP if unsupported;
+ *		-EINVAL for invalid input;
+ *		-ERANGE if no supported level satisfies @round.
+ *
+ *	Locking: caller holds uart_state->port.mutex.
+ *	Interrupts: any.
+ *	May not sleep.
+ *
+ * @get_fifo_control: ``int ()(struct uart_port *port,
+ *                             struct uart_fifo_control *ctl)``
+ *
+ *	Return a cached snapshot of the FIFO state. Must not touch hardware
+ *	and must not sleep: the core calls @get_fifo_control from the sysfs
+ *	is_visible callback at port-registration time (when the port may
+ *	not yet be fully powered) as well as from the rx_trig_bytes /
+ *	tx_trig_bytes / fifo_enable sysfs show handlers under
+ *	uart_state->port.mutex. Drivers should cache the value last
+ *	programmed by @set_fifo_control and return that.
+ *
+ *	Return: 0 on success;
+ *		-EOPNOTSUPP if not implemented.
+ *
+ *	Locking: any.
+ *	Interrupts: any.
+ *	Must not sleep.
+ *
  * @poll_init: ``int ()(struct uart_port *port)``
  *
  *	Called by kgdb to perform the minimal hardware initialization needed to

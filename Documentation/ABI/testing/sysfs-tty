@@ -149,14 +149,48 @@ Description:
 		 Shows current RX interrupt trigger bytes or sets the
 		 user specified value to change it for the FIFO buffer.
 		 Users can show or set this value regardless of opening the
-		 serial device file or not.
+		 serial device file or not. This entry is hidden on devices
+		 which do not support programmable RX FIFO trigger levels.
 
-		 The RX trigger can be set one of four kinds of values for UART
-		 serials. When users input a meaning less value to this I/F,
-		 the RX trigger is changed to the nearest lower value for the
-		 device specification. For example, when user sets 7bytes on
-		 16550A, which has 1/4/8/14 bytes trigger, the RX trigger is
-		 automatically changed to 4 bytes.
+		 The RX trigger can be set to any value up to the
+		 maximum fifo size. Supported values may vary depending on
+		 actual hardware. When users input a value which is NOT
+		 implicitly supported, the RX trigger is changed to the nearest
+		 lower value that the hardware supports. For example, when user
+		 sets 7 bytes on 16550A, which supports 1/4/8/14 bytes trigger,
+		 the RX trigger is automatically changed to 4 bytes.
+
+What:		/sys/class/tty/ttyS<x>/tx_trig_bytes
+Date:
+Contact:	Kyle Bader <kyle.bader94@gmail.com>
+Description:
+		 Shows current TX interrupt trigger bytes or sets the
+		 user specified value to change it for the FIFO buffer.
+		 Users can show or set this value regardless of opening the
+		 serial device file or not. This entry is hidden on devices
+		 which do not support programmable TX FIFO trigger levels.
+
+		 The TX trigger can be set to any value up to the
+		 maximum fifo size. Supported values may vary depending on
+		 actual hardware. When users input a value which is NOT
+		 implicitly supported, the TX trigger is changed to the nearest
+		 lower value that the hardware supports. For example, when user
+		 sets 15 bytes on 16650, which supports 8/16/24/30 bytes trigger,
+		 the TX trigger is automatically changed to 8 bytes.
+
+What:		/sys/class/tty/ttyS<x>/fifo_enable
+Date:
+Contact:	Kyle Bader <kyle.bader94@gmail.com>
+Description:
+		 Allows user to enable or disable the FIFO.
+		 Shows and accepts a boolean variable.
+		 Users can show or set this value regardless of opening the
+		 serial device file or not. This entry is hidden on devices
+		 which have not implemented the get_fifo_control op.
+
+		 In most cases disabling the FIFO still allows characters to be
+		 accumulated within the FIFO, but sets the FIFO trigger levels
+		 to one byte. This is sometimes called '16450 mode'.
 
 What:		/sys/class/tty/ttyS<x>/console
 Date:		February 2020

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Local Interconnect Network (LIN) network layer core configuration
+#
+
+menuconfig LIN
+	tristate "LIN bus subsystem support"
+	help
+	  Local Interconnect Network (LIN) is a low-cost, single-master
+	  serial bus widely used in automotive body electronics for
+	  subsystems where CAN is oversized — door modules, window lifts,
+	  seat controls, and similar. It is specified by ISO 17987.
+
+	  This option enables the PF_LIN protocol family, which provides
+	  socket-based access to LIN network interfaces following the same
+	  model as SocketCAN (PF_CAN). Select this if you want to build
+	  the LIN core; you will also need a driver for your specific
+	  LIN controller under the Network device support section.
+
+if LIN
+
+config LIN_RAW
+	tristate "Raw LIN Protocol (frame-level access with ID filtering)"
+	default y
+	help
+	  The raw LIN protocol offers access to a LIN bus via the BSD
+	  socket API. Applications exchange struct lin_frame with the
+	  kernel and configure subscribe filters, publisher ownership,
+	  master-role claim, and master schedules via setsockopt(). To
+	  send or receive raw LIN frames, use AF_LIN with protocol LIN_RAW.
+
+endif

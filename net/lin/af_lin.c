@@ -9,17 +9,22 @@
  * Modelled on net/can/af_can.c.
  */
 
+#include <linux/if_arp.h>
+#include <linux/if_ether.h>
 #include <linux/init.h>
 #include <linux/kmod.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
+#include <linux/netdevice.h>
 #include <linux/rcupdate.h>
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/stddef.h>
 #include <linux/lin.h>
 #include <linux/lin/core.h>
+#include <linux/lin/dev.h>
+#include <linux/lin/skb.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
 
@@ -214,12 +219,38 @@ void lin_proto_unregister(const struct lin_proto *lp)
 }
 EXPORT_SYMBOL(lin_proto_unregister);
 
+/* af_lin rx packet type handler */
+
+static int lin_rcv(struct sk_buff *skb, struct net_device *dev,
+		   struct packet_type *pt, struct net_device *orig_dev)
+{
+	if (unlikely(dev->type != ARPHRD_LIN ||
+		     !lin_get_ml_priv(dev) ||
+		     !lin_is_lin_skb(skb))) {
+		pr_warn_once("PF_LIN: dropped non-conform LIN skbuff: dev type %d, len %d\n",
+			     dev->type, skb->len);
+		kfree_skb(skb);
+		return NET_RX_DROP;
+	}
+
+	/* Subscriber dispatch (rx filter lists) is added in a subsequent
+	 * commit. Until then, validated LIN frames are consumed here.
+	 */
+	consume_skb(skb);
+	return NET_RX_SUCCESS;
+}
+
 /* af_lin module init / exit */
 
 static const struct net_proto_family lin_family_ops = {
 	.family = PF_LIN,
 	.create = lin_create,
 	.owner  = THIS_MODULE,
+};
+
+static struct packet_type lin_packet __read_mostly = {
+	.type = cpu_to_be16(ETH_P_LIN),
+	.func = lin_rcv,
 };
 
 static __init int lin_init(void)
@@ -232,11 +263,14 @@ static __init int lin_init(void)
 	if (err)
 		return err;
 
+	dev_add_pack(&lin_packet);
+
 	return 0;
 }
 
 static __exit void lin_exit(void)
 {
+	dev_remove_pack(&lin_packet);
 	sock_unregister(PF_LIN);
 	rcu_barrier();
 }

@@ -141,4 +141,43 @@ void lin_rx_unregister(struct net *net, struct net_device *dev,
 		       void (*func)(struct sk_buff *skb, void *data),
 		       void *data);
 
+/**
+ * lin_master_claim - claim the master role on a LIN interface
+ * @dev: target LIN netdev (must not be NULL)
+ * @sk:  socket acquiring the role
+ *
+ * Caller must hold ld->policy_lock. Forwards to the driver's
+ * master_start op after verifying no other socket holds the role.
+ * Takes a reference on @sk which is released by lin_master_release().
+ *
+ * Return: 0 on success, -EBUSY if another socket holds the claim,
+ *         -EOPNOTSUPP if the driver does not support the master role.
+ */
+int  lin_master_claim(struct net_device *dev, struct sock *sk);
+
+/**
+ * lin_master_release - release the master role on a LIN interface
+ * @dev: target LIN netdev
+ * @sk:  socket releasing the role (must be the current master, else no-op)
+ *
+ * Caller must hold ld->policy_lock. Best-effort teardown: the master_sk
+ * slot is cleared and the driver's master_stop op is invoked. Driver
+ * errors are logged via netdev_err but do not block the core slot from
+ * freeing — once a caller has asked for release, holding the slot
+ * because the driver glitched is strictly worse than letting go.
+ *
+ * Always returns 0 when @sk is the current master (or no-op 0 when it
+ * isn't). Userspace gets a single clear answer ("release succeeded");
+ * a misbehaving driver surfaces via dmesg, which is the right channel
+ * for the operator / driver author to act on.
+ *
+ * Acquire is still strict (lin_master_claim propagates driver errors)
+ * because a failed claim is a real "can't proceed." A failed release
+ * has no useful userspace recovery action — the only meaningful
+ * follow-up is close, which converges here anyway.
+ *
+ * Return: 0 (always).
+ */
+int  lin_master_release(struct net_device *dev, struct sock *sk);
+
 #endif /* !_LIN_CORE_H */

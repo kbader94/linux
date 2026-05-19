@@ -15,8 +15,11 @@
 #include <linux/if_arp.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/rcupdate.h>
 #include <linux/lin.h>
+#include <linux/lin/core.h>
 #include <linux/lin/dev.h>
+#include <net/sock.h>
 
 void lin_setup(struct net_device *dev)
 {
@@ -62,6 +65,8 @@ void lin_dev_init(struct net_device *dev, const struct lin_dev_ops *ops,
 	ld->ops = ops;
 	mutex_init(&ld->policy_lock);
 	lin_dev_rcv_lists_init(&ld->rcv_lists);
+	RCU_INIT_POINTER(ld->master_sk, NULL);
+	ld->going_down = false;
 
 	lin_set_ml_priv(dev, ld);
 }
@@ -116,6 +121,90 @@ void free_lindev(struct net_device *dev)
 	free_netdev(dev);
 }
 EXPORT_SYMBOL(free_lindev);
+
+/* Cross-socket policy helpers: master claim.
+ * All mutating calls are serialised by ld->policy_lock; rx readers use
+ * rcu_read_lock() around dereferences of ld->master_sk and gate every
+ * subsequent sock field access on refcount_inc_not_zero(&sk->sk_refcnt)
+ * so a sock observed mid-teardown is skipped rather than held. That
+ * removes any need to defer the writer's sock_put across an RCU grace
+ * period: clear the slot under policy_lock, drop the held reference
+ * inline, and concurrent rx readers either grabbed their own reference
+ * first (sock stays alive) or see a dead refcount and skip (sock_free
+ * completes via sk_rcu independently).
+ *
+ * The mutex (rather than rtnl_lock) keeps a sleeping driver op from
+ * blocking unrelated subsystems: the worst case is contention with
+ * other policy operations on the same interface, plus blocking
+ * NETDEV_UNREGISTER for that interface (the notifier needs sock_lock).
+ */
+
+int lin_master_claim(struct net_device *dev, struct sock *sk)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct sock *current_master;
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->master_start)
+		return -EOPNOTSUPP;
+
+	current_master = rcu_dereference_protected(ld->master_sk,
+						   lockdep_is_held(&ld->policy_lock));
+	if (current_master == sk)
+		return 0;
+	if (current_master)
+		return -EBUSY;
+
+	/* Driver op may sleep; call before publishing the pointer so we
+	 * never expose a claim the hardware has not acknowledged.
+	 */
+	err = ld->ops->master_start(ld);
+	if (err)
+		return err;
+
+	sock_hold(sk);
+	rcu_assign_pointer(ld->master_sk, sk);
+	return 0;
+}
+EXPORT_SYMBOL(lin_master_claim);
+
+int lin_master_release(struct net_device *dev, struct sock *sk)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct sock *current_master;
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	current_master = rcu_dereference_protected(ld->master_sk,
+						   lockdep_is_held(&ld->policy_lock));
+	if (current_master != sk)
+		return 0;
+
+	/* Best-effort teardown: clear core state regardless of driver
+	 * errors. A wedged driver surfaces via dmesg, not via a
+	 * propagated errno that userspace has no realistic way to
+	 * handle — the only meaningful userspace response to "release
+	 * failed" is "close the socket," which goes through this same
+	 * path anyway.
+	 */
+	rcu_assign_pointer(ld->master_sk, NULL);
+
+	err = ld->ops->master_stop(ld);
+	if (err)
+		netdev_err(dev, "LIN master_stop returned %d on release; driver may be in an inconsistent state\n",
+			   err);
+
+	sock_put(current_master);
+	return 0;
+}
+EXPORT_SYMBOL(lin_master_release);
 
 int lin_register_netdev(struct net_device *dev)
 {

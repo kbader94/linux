@@ -8,12 +8,12 @@
  * Modelled on net/can/raw.c, adapted for LIN's single-master protocol
  * model: frame emission timing is owned by the driver's schedule
  * engine (configured by the LIN core via lin_dev_ops), and
- * bind/publish/master sockopts scope per ifindex. This commit
- * implements the rx side —
- * LIN_RAW_FILTER, LIN_RAW_ERR_FILTER, LIN_RAW_JOIN_FILTERS,
- * LIN_RAW_RECV_OWN_MSGS — plus bind(), getname(), and the notifier
- * that tears down bound sockets when their netdev disappears. The
- * master/publisher/schedule sockopts land in later commits.
+ * bind/publish/master sockopts scope per ifindex. Implements the rx
+ * side (LIN_RAW_FILTER, LIN_RAW_ERR_FILTER, LIN_RAW_JOIN_FILTERS,
+ * LIN_RAW_RECV_OWN_MSGS) plus bind(), getname(), the notifier that
+ * tears down bound sockets when their netdev disappears, and the
+ * LIN_RAW_MASTER role-claim sockopt. The publisher / schedule /
+ * send-header sockopts land in later commits.
  */
 
 #include <linux/if_arp.h>
@@ -71,6 +71,7 @@ struct lin_raw_sock {
 	struct list_head	notifier;
 	int			ifindex;
 	unsigned int		bound:1;
+	unsigned int		is_master:1;	/* LIN_RAW_MASTER held */
 	unsigned int		join_filters:1;
 	__u32			err_mask;
 	int			count;
@@ -269,20 +270,65 @@ static void lin_raw_disable_allfilters(struct net *net,
 	lin_raw_disable_errfilter(net, dev, sk, ro->err_mask);
 }
 
-/* netdev event notifier — tear down sockets bound to a vanishing dev.
+/* Release this socket's per-bus policy state on @dev: the master claim
+ * (publisher entries are added with the publisher registry). Shared by
+ * close(), rebind, and the GOING_DOWN / UNREGISTER notifiers so every
+ * teardown path drops the same driver-side ownership — otherwise a path
+ * that forgets it (as the rebind path originally did) leaves the core's
+ * master_sk / publishers[] pointing at a gone socket with held refs and
+ * the driver's schedule engine / response table still live.
  *
- * The NETDEV_UNREGISTER / NETDEV_DOWN paths reach us from
- * unregister_netdevice() or dev_close(), both of which always hold
- * rtnl_lock. We rely on that here so core helpers gated by
- * ASSERT_RTNL() — lin_master_release(), lin_publisher_clear() — can
- * be called directly. Taking rtnl_lock explicitly in the notifier
- * would deadlock against the caller.
+ * Caller must hold rtnl_lock so these driver ops cannot race the netdev
+ * close path (ndo_stop); the policy_lock taken here serialises against
+ * other policy operations on the interface.
+ */
+static void lin_raw_drop_dev_policy(struct lin_raw_sock *ro,
+				    struct net_device *dev)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct sock *sk = &ro->lin.sk;
+
+	ASSERT_RTNL();
+
+	if (!ld)
+		return;
+
+	mutex_lock(&ld->policy_lock);
+	if (ro->is_master) {
+		lin_master_release(dev, sk);
+		ro->is_master = 0;
+	}
+	mutex_unlock(&ld->policy_lock);
+}
+
+/* netdev event notifier — per-socket teardown of LIN_RAW sockets bound
+ * to a closing / vanishing dev.
+ *
+ * Phase split with the core notifier:
+ *
+ *   The af_lin core registers its own netdev notifier at higher
+ *   priority. The core's GOING_DOWN handler sets ld->going_down under
+ *   ld->policy_lock so any sockopt waiting on the lock returns
+ *   -ENETDOWN on wakeup before touching the driver; UP clears it.
+ *   That makes the lifecycle of @going_down independent of which
+ *   protocol modules have sockets bound.
+ *
+ *   This per-protocol notifier handles only the per-socket state:
+ *   force-release of the master claim at GOING_DOWN, sk_err signaling
+ *   at DOWN, and the full unbind at UNREGISTER. We do not touch
+ *   @going_down here — that's the core's job.
+ *
+ * Lock ordering across these paths: rtnl_lock (held by the dev_close
+ * / unregister_netdevice caller) -> lock_sock(sk) -> ld->policy_lock.
+ * Taking rtnl_lock again here would deadlock; we don't, and don't need
+ * to because the per-device policy_lock already serialises us against
+ * concurrent sockopts.
  */
 
 static void lin_raw_notify(struct lin_raw_sock *ro, unsigned long msg,
 			   struct net_device *dev)
 {
-	struct sock *sk = &ro->sk;
+	struct sock *sk = &ro->lin.sk;
 
 	if (!net_eq(dev_net(dev), sock_net(sk)))
 		return;
@@ -293,6 +339,7 @@ static void lin_raw_notify(struct lin_raw_sock *ro, unsigned long msg,
 	case NETDEV_UNREGISTER:
 		lock_sock(sk);
 		if (ro->bound) {
+			lin_raw_drop_dev_policy(ro, dev);
 			lin_raw_disable_allfilters(dev_net(dev), dev, sk);
 			netdev_put(ro->dev, &ro->dev_tracker);
 		}
@@ -304,6 +351,22 @@ static void lin_raw_notify(struct lin_raw_sock *ro, unsigned long msg,
 		sk->sk_err = ENODEV;
 		if (!sock_flag(sk, SOCK_DEAD))
 			sk_error_report(sk);
+		break;
+
+	case NETDEV_GOING_DOWN:
+		/* The core's higher-priority netdev notifier has already
+		 * set ld->going_down under policy_lock, so any sockopt
+		 * blocked on the lock will see -ENETDOWN on wakeup before
+		 * touching the driver. Our job here is the per-socket
+		 * teardown: drop the master claim while the driver is
+		 * still alive. Filters, binding, and the netdev reference
+		 * survive so the socket remains usable as a passive
+		 * observer when the interface returns.
+		 */
+		lock_sock(sk);
+		if (ro->bound)
+			lin_raw_drop_dev_policy(ro, dev);
+		release_sock(sk);
 		break;
 
 	case NETDEV_DOWN:
@@ -322,7 +385,8 @@ static int lin_raw_notifier(struct notifier_block *nb, unsigned long msg,
 
 	if (dev->type != ARPHRD_LIN)
 		return NOTIFY_DONE;
-	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
+	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN &&
+	    msg != NETDEV_GOING_DOWN)
 		return NOTIFY_DONE;
 	if (unlikely(lin_raw_busy_notifier))	/* guard against reentrancy */
 		return NOTIFY_DONE;
@@ -351,6 +415,7 @@ static int lin_raw_init(struct sock *sk)
 	struct lin_raw_sock *ro = lin_raw_sk(sk);
 
 	ro->bound		= 0;
+	ro->is_master		= 0;
 	ro->ifindex		= 0;
 	ro->dev			= NULL;
 	ro->lin.loopback		= 1;
@@ -402,6 +467,19 @@ static int lin_raw_release(struct socket *sock)
 	 */
 	warn_deadline = jiffies + 5 * HZ;
 
+	/* Take rtnl_lock first. Unlike CAN_RAW — whose release only drops
+	 * core-side rx filters — LIN's teardown invokes driver policy ops
+	 * (master_stop via lin_master_release; clear_response via the
+	 * publisher teardown) that must not race the netdev close path's
+	 * ndo_stop(). The GOING_DOWN / UNREGISTER notifiers that perform the
+	 * same teardown already run under rtnl; serialise this path with
+	 * them. With rtnl held no netdev notifier can run, so the
+	 * busy-notifier wait below is satisfied immediately (any in-flight
+	 * notifier completed before we acquired rtnl) and is kept only as
+	 * defence. Acquisition order matches bind(): rtnl_lock -> lock_sock.
+	 */
+	rtnl_lock();
+
 	spin_lock(&lin_raw_notifier_lock);
 	while (lin_raw_busy_notifier == ro) {
 		spin_unlock(&lin_raw_notifier_lock);
@@ -414,20 +492,21 @@ static int lin_raw_release(struct socket *sock)
 	list_del(&ro->notifier);
 	spin_unlock(&lin_raw_notifier_lock);
 
-	/* Locking model for release: the notifier-list dance above
-	 * guarantees no future notifier picks up @ro, and any in-flight
-	 * notifier on @ro has finished. lock_sock(sk) then serialises us
-	 * against the notifier code path itself, which takes lock_sock
-	 * before mutating ro->dev / ro->bound. We do NOT take rtnl_lock
-	 * here: nothing in this path touches state that rtnl protects
-	 * (rcv-list mutations use rcvlists_lock; the netdev itself is
-	 * pinned by ro->dev_tracker), so taking rtnl would only add
-	 * contention against unrelated rtnetlink users.
+	/* lock_sock(sk) serialises against the notifier's own lock_sock
+	 * section, which mutates ro->dev / ro->bound.
 	 */
 	lock_sock(sk);
 
 	if (ro->bound) {
+		/* Tear down in the order that keeps the bus quiet for the
+		 * longest possible window: stop header emission (master
+		 * release) first, then unhook rx filters, then drop the
+		 * netdev reference. Use force variants — the socket is
+		 * going away and we must free core-side ownership
+		 * regardless of whether the driver can cleanly quiesce.
+		 */
 		if (ro->dev) {
+			lin_raw_drop_dev_policy(ro, ro->dev);
 			lin_raw_disable_allfilters(dev_net(ro->dev),
 						   ro->dev, sk);
 			netdev_put(ro->dev, &ro->dev_tracker);
@@ -435,6 +514,12 @@ static int lin_raw_release(struct socket *sock)
 			lin_raw_disable_allfilters(net, NULL, sk);
 		}
 	}
+
+	/* Driver-policy teardown is done; drop rtnl before the grace-period
+	 * wait below so it never blocks unrelated rtnetlink users. The
+	 * remaining teardown needs only lock_sock.
+	 */
+	rtnl_unlock();
 
 	if (ro->count > 1)
 		kfree(ro->filter);
@@ -527,8 +612,14 @@ static int lin_raw_bind(struct socket *sock, struct sockaddr_unsized *uaddr,
 
 	if (!err) {
 		if (ro->bound) {
-			/* unregister old filters */
+			/* Drop the old bus binding: release this socket's
+			 * policy state (master claim / publisher entries) on
+			 * the old dev, then its rx filters and netdev ref.
+			 * rtnl_lock is already held above, satisfying
+			 * lin_raw_drop_dev_policy()'s contract.
+			 */
 			if (ro->dev) {
+				lin_raw_drop_dev_policy(ro, ro->dev);
 				lin_raw_disable_allfilters(dev_net(ro->dev),
 							   ro->dev, sk);
 				netdev_put(ro->dev, &ro->dev_tracker);
@@ -815,6 +906,68 @@ static int lin_raw_set_flag(struct sock *sk, int optname, sockptr_t optval,
 	return 0;
 }
 
+/* LIN_RAW_MASTER: claim or release master role on the bound interface. */
+
+static int lin_raw_set_master(struct sock *sk, sockptr_t optval,
+			      unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int flag, err = 0;
+
+	if (optlen != sizeof(flag))
+		return -EINVAL;
+	if (copy_from_sockptr(&flag, optval, sizeof(flag)))
+		return -EFAULT;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	/* Re-test IFF_UP under policy_lock and combine with going_down
+	 * (see struct lin_dev kdoc): together they close the dev_close
+	 * race window between NETDEV_GOING_DOWN and IFF_UP clearing.
+	 */
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	if (flag) {
+		if (!ro->is_master) {
+			err = lin_master_claim(ro->dev, sk);
+			if (!err)
+				ro->is_master = 1;
+		}
+	} else if (ro->is_master) {
+		/* Release is best-effort and always succeeds at the core
+		 * level; a misbehaving driver surfaces via dmesg, not via
+		 * a propagated errno (see lin_master_release()'s kdoc).
+		 */
+		lin_master_release(ro->dev, sk);
+		ro->is_master = 0;
+	}
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
 static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 			      sockptr_t optval, unsigned int optlen)
 {
@@ -832,6 +985,8 @@ static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 	case LIN_RAW_RECV_OWN_MSGS:
 	case LIN_RAW_JOIN_FILTERS:
 		return lin_raw_set_flag(sk, optname, optval, optlen);
+	case LIN_RAW_MASTER:
+		return lin_raw_set_master(sk, optval, optlen);
 	default:
 		return -ENOPROTOOPT;
 	}

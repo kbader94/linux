@@ -22,6 +22,7 @@ struct lin_dev;
 struct lin_frame;
 struct lin_schedule;
 struct sk_buff;
+struct sock;
 
 /*
  * Driver capability flags (LIN_CAP_*) are defined in
@@ -347,18 +348,30 @@ struct lin_dev_rcv_lists {
  * @rcv_lists:   rx subscriber lists for this interface; see
  *               struct lin_dev_rcv_lists
  * @policy_lock: serialises mutation of cross-socket policy state on
- *               this interface (master claim, publisher registry,
- *               schedules — added by later commits). Held across
- *               driver op calls so the single-master-per-interface
- *               and single-publisher-per-ID invariants hold even when
+ *               this interface (master_sk, publishers, schedules
+ *               — added by later commits). Held across driver op
+ *               calls so the single-master-per-interface and
+ *               single-publisher-per-ID invariants hold even when
  *               driver ops sleep, without serialising on rtnl_lock.
  *               Lock ordering: rtnl_lock (when held by the caller)
  *               -> sock_lock(sk) -> ld->policy_lock.
+ * @master_sk:   socket currently holding the LIN_RAW_MASTER claim on
+ *               this interface, or NULL. Mutation under @policy_lock;
+ *               rx readers use rcu_dereference under rcu_read_lock()
+ *               and gate every subsequent sock dereference on
+ *               refcount_inc_not_zero(&sk->sk_refcnt) so a sock
+ *               observed mid-teardown is skipped.
+ * @going_down:  quiesce flag set by the LIN core's NETDEV_GOING_DOWN
+ *               notifier under @policy_lock and cleared on NETDEV_UP.
+ *               Sockopt entry points consult it under @policy_lock
+ *               and bail with -ENETDOWN before touching driver ops,
+ *               so a userspace caller racing with link-down does not
+ *               collide with the GOING_DOWN-time force-release of
+ *               master state from the per-protocol notifier.
  *
  * Installed on net_device.ml_priv with type tag ML_PRIV_LIN by
- * alloc_lindev(). Subsequent commits extend this structure with the
- * cross-socket policy state the LIN core tracks: master-role claim,
- * publisher-ownership registry, and loaded schedule tracking. The
+ * alloc_lindev(). Subsequent commits extend this structure with
+ * publisher-ownership registry and loaded schedule tracking. The
  * actual schedule execution and hardware response table live in the
  * driver; the core forwards validated state to it via struct
  * lin_dev_ops.
@@ -369,6 +382,8 @@ struct lin_dev {
 	u32				 caps;
 	struct lin_dev_rcv_lists	 rcv_lists;
 	struct mutex			 policy_lock;
+	struct sock __rcu		*master_sk;
+	bool				 going_down;
 };
 
 /* Initialize a struct lin_dev_rcv_lists in place. */

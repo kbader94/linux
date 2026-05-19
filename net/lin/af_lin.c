@@ -602,6 +602,96 @@ static struct packet_type lin_packet __read_mostly = {
 	.func = lin_rcv,
 };
 
+/* Core netdev notifier — manages ld->going_down across the dev_close
+ * window so policy ops cannot race ndo_stop().
+ *
+ * Background. dev_close() runs under rtnl_lock and unfolds as:
+ *
+ *     1. call_netdevice_notifiers(NETDEV_GOING_DOWN)   IFF_UP still set
+ *     2. ops->ndo_stop(dev)
+ *     3. dev->flags &= ~IFF_UP
+ *     4. call_netdevice_notifiers(NETDEV_DOWN)         IFF_UP cleared
+ *
+ * A LIN policy sockopt runs without rtnl_lock. If it sampled IFF_UP
+ * anywhere between steps 1 and 3 the test would pass, the sockopt
+ * would acquire ld->policy_lock and call into a driver op while
+ * ndo_stop() was still running on the rtnl-holding CPU.
+ *
+ * socketCAN does not have this race: every CAN emission routes
+ * through dev_queue_xmit() and inherits the standard tx pipeline's
+ * dev_deactivate() drain. socketCAN also carries no cross-socket
+ * policy state. LIN tracks per-interface master / publisher /
+ * schedule ownership and calls driver ops outside the tx pipeline,
+ * so the dev_deactivate guarantee does not apply to us; the LIN core
+ * must build the equivalent.
+ *
+ * That equivalent is @policy_lock + @going_down. This notifier owns
+ * the flag:
+ *
+ *   - NETDEV_GOING_DOWN (step 1, IFF_UP still set, driver still alive):
+ *       take policy_lock, set going_down = true, drop the lock.
+ *       Any sockopt currently blocked on policy_lock observes
+ *       going_down on wakeup and bails with -ENETDOWN without
+ *       calling any driver op. Per-protocol notifiers (priority 0;
+ *       this one runs at priority 1) then perform their per-socket
+ *       force-release while the driver is still safe to call.
+ *
+ *   - NETDEV_UP: clear going_down so policy ops are accepted again.
+ *       Userspace re-establishes master / publishers / schedules
+ *       explicitly — the kernel does not replay them across a
+ *       down/up cycle. Doing this in the core notifier (rather than
+ *       in a per-socket walk) keeps the flag lifecycle correct even
+ *       when no LIN socket is bound across the bounce.
+ *
+ * NETDEV_DOWN is handled per-protocol (sk_err = ENETDOWN) and does
+ * not require any policy-state work — by then IFF_UP is cleared and
+ * the IFF_UP gate in sockopts catches new entrants. NETDEV_UNREGISTER
+ * is also per-protocol (full socket unbind).
+ *
+ * Lock ordering: rtnl_lock (held by dev_close caller) ->
+ * ld->policy_lock. We never take rtnl ourselves here.
+ */
+static int lin_netdev_event(struct notifier_block *nb, unsigned long msg,
+			    void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct lin_dev *ld;
+
+	if (dev->type != ARPHRD_LIN)
+		return NOTIFY_DONE;
+	if (msg != NETDEV_GOING_DOWN && msg != NETDEV_UP)
+		return NOTIFY_DONE;
+
+	ld = lin_get_ml_priv(dev);
+	if (!ld)
+		return NOTIFY_DONE;
+
+	mutex_lock(&ld->policy_lock);
+	switch (msg) {
+	case NETDEV_GOING_DOWN:
+		ld->going_down = true;
+		break;
+	case NETDEV_UP:
+		ld->going_down = false;
+		break;
+	}
+	mutex_unlock(&ld->policy_lock);
+
+	return NOTIFY_DONE;
+}
+
+/* Priority 1 so this core notifier runs before any protocol notifier
+ * (the LIN_RAW per-socket notifier registers at the default priority
+ * 0). The protocol notifier depends on @going_down already being set
+ * when its NETDEV_GOING_DOWN handler runs, so any sockopt that
+ * observes the per-socket force-release also observes going_down ==
+ * true under policy_lock and refuses to re-claim.
+ */
+static struct notifier_block lin_netdev_notifier __read_mostly = {
+	.notifier_call	= lin_netdev_event,
+	.priority	= 1,
+};
+
 static __init int lin_init(void)
 {
 	int err;
@@ -618,14 +708,20 @@ static __init int lin_init(void)
 	if (err)
 		goto out_cache;
 
-	err = sock_register(&lin_family_ops);
+	err = register_netdevice_notifier(&lin_netdev_notifier);
 	if (err)
 		goto out_pernet;
+
+	err = sock_register(&lin_family_ops);
+	if (err)
+		goto out_notifier;
 
 	dev_add_pack(&lin_packet);
 
 	return 0;
 
+out_notifier:
+	unregister_netdevice_notifier(&lin_netdev_notifier);
 out_pernet:
 	unregister_pernet_subsys(&lin_pernet_ops);
 out_cache:
@@ -637,6 +733,7 @@ static __exit void lin_exit(void)
 {
 	dev_remove_pack(&lin_packet);
 	sock_unregister(PF_LIN);
+	unregister_netdevice_notifier(&lin_netdev_notifier);
 	unregister_pernet_subsys(&lin_pernet_ops);
 
 	rcu_barrier();

@@ -16,6 +16,8 @@
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/rcupdate.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/lin.h>
 #include <linux/lin/core.h>
 #include <linux/lin/dev.h>
@@ -67,6 +69,8 @@ void lin_dev_init(struct net_device *dev, const struct lin_dev_ops *ops,
 	lin_dev_rcv_lists_init(&ld->rcv_lists);
 	RCU_INIT_POINTER(ld->master_sk, NULL);
 	memset(ld->publishers, 0, sizeof(ld->publishers));
+	ld->active_schedule = -1;
+	bitmap_zero(ld->schedules_loaded, LIN_RAW_SCHEDULES_MAX);
 	ld->going_down = false;
 
 	lin_set_ml_priv(dev, ld);
@@ -194,7 +198,13 @@ int lin_master_release(struct net_device *dev, struct sock *sk)
 	 * handle — the only meaningful userspace response to "release
 	 * failed" is "close the socket," which goes through this same
 	 * path anyway.
+	 *
+	 * Schedule cleanup runs before clearing master_sk so the
+	 * driver sees teardown under the same master identity it has
+	 * been driving under.
 	 */
+	lin_schedule_release_all(dev, sk);
+
 	rcu_assign_pointer(ld->master_sk, NULL);
 
 	err = ld->ops->master_stop(ld);
@@ -356,6 +366,333 @@ void lin_publisher_release_all(struct net_device *dev, struct sock *sk)
 	}
 }
 EXPORT_SYMBOL(lin_publisher_release_all);
+
+/* Schedule validation + registry.
+ *
+ * The driver owns the actual schedule execution and timing. The core
+ * keeps just enough metadata to enforce cross-socket policy: a per-dev
+ * bitmap of loaded handles and the currently-active handle. Sporadic
+ * publisher existence is validated up front at LOAD time (fail-fast)
+ * rather than re-checked at ACTIVATE.
+ */
+
+static int lin_schedule_validate_entry(const struct lin_dev *ld,
+				       const struct lin_schedule_entry *e)
+{
+	unsigned int i;
+	bool seen_diag;
+
+	/* @cr_handle is reserved for TYPE_EVENT (introduced in a later
+	 * commit); for every type validated here it must be zero.
+	 */
+	if (e->flags || e->cr_handle)
+		return -EINVAL;
+	if (memchr_inv(e->__res, 0, sizeof(e->__res)))
+		return -EINVAL;
+	if (e->member_count < 1 || e->member_count > LIN_SLOT_MAX_MEMBERS)
+		return -EINVAL;
+
+	/* Trailing members beyond member_count must be zero so a future
+	 * extension that uses them as fallback can't be silently mis-fed
+	 * by a stale userspace buffer.
+	 */
+	for (i = e->member_count; i < LIN_SLOT_MAX_MEMBERS; i++) {
+		if (e->members[i])
+			return -EINVAL;
+	}
+
+	/* Member ID validity: in-range, non-reserved, except for the
+	 * type-specific exceptions checked below.
+	 */
+	seen_diag = false;
+	for (i = 0; i < e->member_count; i++) {
+		u8 id = e->members[i];
+
+		if (id & ~LIN_ID_MASK)
+			return -EINVAL;
+		if (id == LIN_ID_DIAG_MASTER_REQ ||
+		    id == LIN_ID_DIAG_SLAVE_RESP)
+			seen_diag = true;
+		else if (id >= LIN_ID_RESERVED_FIRST)
+			return -EINVAL;
+	}
+
+	switch (e->type) {
+	case LIN_SCHED_TYPE_UNCOND:
+		if (e->member_count != 1)
+			return -EINVAL;
+		if (seen_diag)
+			return -EINVAL;
+		break;
+	case LIN_SCHED_TYPE_DIAG:
+		if (!(ld->caps & LIN_CAP_DIAG))
+			return -EOPNOTSUPP;
+		if (e->member_count != 1)
+			return -EINVAL;
+		if (!seen_diag)
+			return -EINVAL;
+		break;
+	case LIN_SCHED_TYPE_SPORADIC:
+		if (!(ld->caps & LIN_CAP_SPORADIC))
+			return -EOPNOTSUPP;
+		if (seen_diag)
+			return -EINVAL;
+		/* Publisher existence checked separately by caller after
+		 * structural validation succeeds for the whole schedule.
+		 */
+		break;
+	case LIN_SCHED_TYPE_EVENT:
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int lin_schedule_validate(const struct lin_dev *ld,
+				 const struct lin_schedule *sched,
+				 size_t buf_size)
+{
+	size_t need;
+	unsigned int i;
+	int err;
+
+	if (!sched)
+		return -EINVAL;
+	if (sched->flags)
+		return -EINVAL;
+	if (memchr_inv(sched->__res, 0, sizeof(sched->__res)))
+		return -EINVAL;
+	if (sched->handle >= LIN_RAW_SCHEDULES_MAX)
+		return -EINVAL;
+	if (sched->entry_count < 1 ||
+	    sched->entry_count > LIN_RAW_SCHEDULE_ENTRIES_MAX)
+		return -EINVAL;
+	if (sched->default_slot_us > LIN_RAW_SCHEDULE_SLOT_MAX_US)
+		return -EINVAL;
+
+	need = sizeof(*sched) +
+	       (size_t)sched->entry_count *
+	       sizeof(struct lin_schedule_entry);
+	if (buf_size != need)
+		return -EINVAL;
+
+	for (i = 0; i < sched->entry_count; i++) {
+		const struct lin_schedule_entry *e = &sched->entry[i];
+		u32 effective_slot_us;
+
+		err = lin_schedule_validate_entry(ld, e);
+		if (err)
+			return err;
+
+		/* Effective slot duration must be non-zero and within
+		 * LIN_RAW_SCHEDULE_SLOT_MAX_US. A per-entry @slot_us of
+		 * 0 inherits @sched->default_slot_us; if both are zero
+		 * the slot has no defined duration on the wire. The
+		 * upper bound prevents userspace from stalling kernel
+		 * policy operations (LIN_RAW_SCHEDULE_ACTIVATE blocks
+		 * for up to one slot duration of the prior schedule).
+		 */
+		if (e->slot_us > LIN_RAW_SCHEDULE_SLOT_MAX_US)
+			return -EINVAL;
+		effective_slot_us = e->slot_us ? e->slot_us :
+						 sched->default_slot_us;
+		if (!effective_slot_us)
+			return -EINVAL;
+	}
+
+	/* Publisher existence check for sporadic members. Done after the
+	 * structural pass so any -EINVAL/-EOPNOTSUPP from a malformed
+	 * entry takes precedence over a missing publisher complaint.
+	 */
+	for (i = 0; i < sched->entry_count; i++) {
+		const struct lin_schedule_entry *e = &sched->entry[i];
+		unsigned int j;
+
+		if (e->type != LIN_SCHED_TYPE_SPORADIC)
+			continue;
+
+		for (j = 0; j < e->member_count; j++) {
+			if (!rcu_dereference_protected(ld->publishers[e->members[j]],
+						       lockdep_is_held(&ld->policy_lock)))
+				return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+int lin_schedule_load(struct net_device *dev, struct sock *sk,
+		      const struct lin_schedule *sched, size_t buf_size)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->schedule_load)
+		return -EOPNOTSUPP;
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return -EPERM;
+
+	err = lin_schedule_validate(ld, sched, buf_size);
+	if (err)
+		return err;
+
+	/* Replacing the currently-active handle would force the driver
+	 * to mutate live schedule execution — every driver would have
+	 * to stage atomically to keep the bus traffic well-defined.
+	 * Disallow it: callers must LIN_RAW_SCHEDULE_STOP first, load,
+	 * then re-activate. Symmetric with schedule_delete's active-
+	 * handle rejection.
+	 */
+	if (ld->active_schedule >= 0 &&
+	    sched->handle == (u8)ld->active_schedule)
+		return -EBUSY;
+
+	err = ld->ops->schedule_load(ld, sched);
+	if (err)
+		return err;
+
+	set_bit(sched->handle, ld->schedules_loaded);
+	return 0;
+}
+EXPORT_SYMBOL(lin_schedule_load);
+
+int lin_schedule_delete(struct net_device *dev, struct sock *sk,
+			u8 handle)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->schedule_delete)
+		return -EOPNOTSUPP;
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return -EPERM;
+	if (handle >= LIN_RAW_SCHEDULES_MAX)
+		return -EINVAL;
+	if (!test_bit(handle, ld->schedules_loaded))
+		return -ENOENT;
+	if (ld->active_schedule == handle)
+		return -EBUSY;
+
+	err = ld->ops->schedule_delete(ld, handle);
+	if (err)
+		return err;
+
+	clear_bit(handle, ld->schedules_loaded);
+	return 0;
+}
+EXPORT_SYMBOL(lin_schedule_delete);
+
+int lin_schedule_activate(struct net_device *dev, struct sock *sk,
+			  u8 handle)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->schedule_activate)
+		return -EOPNOTSUPP;
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return -EPERM;
+	if (handle >= LIN_RAW_SCHEDULES_MAX)
+		return -EINVAL;
+	if (!test_bit(handle, ld->schedules_loaded))
+		return -ENOENT;
+
+	/* Idempotent: same-handle activation is a no-op. Skip the driver
+	 * op so a bounded wait isn't taken for a swap that wouldn't
+	 * happen anyway.
+	 */
+	if (ld->active_schedule >= 0 &&
+	    handle == (u8)ld->active_schedule)
+		return 0;
+
+	/* Publisher existence for sporadic members is validated at LOAD
+	 * time; the user has been informed of any misconfiguration before
+	 * reaching here. If a sporadic member's publisher has since been
+	 * unregistered, that slot will fire silently — well-defined
+	 * degraded behaviour, not an activation error.
+	 */
+
+	err = ld->ops->schedule_activate(ld, handle);
+	if (err)
+		return err;
+
+	ld->active_schedule = handle;
+	return 0;
+}
+EXPORT_SYMBOL(lin_schedule_activate);
+
+int lin_schedule_stop(struct net_device *dev, struct sock *sk)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->schedule_stop)
+		return -EOPNOTSUPP;
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return -EPERM;
+	if (ld->active_schedule < 0)
+		return 0;	/* idempotent */
+
+	err = ld->ops->schedule_stop(ld);
+	if (err)
+		return err;
+
+	ld->active_schedule = -1;
+	return 0;
+}
+EXPORT_SYMBOL(lin_schedule_stop);
+
+void lin_schedule_release_all(struct net_device *dev, struct sock *sk)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	unsigned int handle;
+	int err;
+
+	might_sleep();
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->schedule_stop)
+		return;
+
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return;
+
+	if (ld->active_schedule >= 0) {
+		err = ld->ops->schedule_stop(ld);
+		if (err)
+			netdev_err(dev, "LIN schedule_stop op returned %d on forced release; driver may still be running schedule\n",
+				   err);
+		ld->active_schedule = -1;
+	}
+
+	for_each_set_bit(handle, ld->schedules_loaded,
+			 LIN_RAW_SCHEDULES_MAX) {
+		err = ld->ops->schedule_delete(ld, handle);
+		if (err)
+			netdev_err(dev, "LIN schedule_delete op for handle %u returned %d on forced release; driver may still hold schedule\n",
+				   handle, err);
+	}
+	bitmap_zero(ld->schedules_loaded, LIN_RAW_SCHEDULES_MAX);
+}
+EXPORT_SYMBOL(lin_schedule_release_all);
 
 int lin_register_netdev(struct net_device *dev)
 {

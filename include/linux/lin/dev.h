@@ -11,12 +11,14 @@
 #ifndef _LIN_DEV_H
 #define _LIN_DEV_H
 
+#include <linux/bitmap.h>
 #include <linux/lin.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/types.h>
 #include <uapi/linux/lin/netlink.h>
+#include <uapi/linux/lin/raw.h>
 
 struct lin_dev;
 struct lin_frame;
@@ -364,6 +366,13 @@ struct lin_dev_rcv_lists {
  * @publishers:  per-6-bit-ID socket that currently publishes the
  *               response for that ID, or NULL. Same locking rules as
  *               @master_sk.
+ * @schedules_loaded: bitmap of schedule handles currently loaded in
+ *               the driver. Indexed by handle, size
+ *               LIN_RAW_SCHEDULES_MAX. Maintained by the core so it
+ *               can reject ACTIVATE/DELETE of unknown handles. All
+ *               entries are auto-cleared when master is released.
+ * @active_schedule: handle of the currently-running schedule, or -1
+ *               if none is active.
  * @going_down:  quiesce flag set by the LIN core's NETDEV_GOING_DOWN
  *               notifier under @policy_lock and cleared on NETDEV_UP.
  *               Sockopt entry points consult it under @policy_lock
@@ -387,6 +396,8 @@ struct lin_dev {
 	struct mutex			 policy_lock;
 	struct sock __rcu		*master_sk;
 	struct sock __rcu		*publishers[LIN_ID_MASK + 1];
+	DECLARE_BITMAP(schedules_loaded, LIN_RAW_SCHEDULES_MAX);
+	int				 active_schedule;
 	bool				 going_down;
 	/* Operator override of the LIN_CAP_PUB_SLAVE cap-gate, set via
 	 * the rtnetlink IFLA_LIN_FORCE_PUB_SLAVE attribute (wired in a

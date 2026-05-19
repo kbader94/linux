@@ -16,6 +16,11 @@
 #include <linux/skbuff.h>
 #include <net/sock.h>
 
+/* Defined in <uapi/linux/lin/raw.h>; only referenced here by pointer
+ * in the lin_schedule_load() prototype.
+ */
+struct lin_schedule;
+
 #define LIN_DNAME(dev) ((dev) ? (dev)->name : "any")
 
 /**
@@ -249,5 +254,94 @@ int  lin_publisher_clear(struct net_device *dev, struct sock *sk,
  * so there is no race with concurrent publisher mutations.
  */
 void lin_publisher_release_all(struct net_device *dev, struct sock *sk);
+
+/**
+ * lin_schedule_load - install or replace a master schedule
+ * @dev:       target LIN netdev
+ * @sk:        owning socket; must currently hold the master role
+ * @sched:     pre-validated schedule struct (handle, entries, timings)
+ * @buf_size:  byte length of the @sched buffer as passed from userspace;
+ *             used by the core to bound entry-count validation
+ *
+ * Validates the schedule structure (field ranges, reserved bits, per-
+ * entry frame types, reserved IDs, and that every TYPE_SPORADIC member
+ * has a publisher already registered on @dev), then forwards to the
+ * driver's schedule_load op. On success, marks the handle loaded in
+ * ld->schedules_loaded.
+ *
+ * Caller must hold ld->policy_lock.
+ *
+ * Return: 0 on success, -EPERM if @sk is not the current master,
+ *         -EOPNOTSUPP if the driver does not implement schedule ops,
+ *         -EINVAL on validation failure, -EBUSY if @sched->handle is
+ *         the currently-active schedule (caller must stop first),
+ *         -errno from the driver.
+ */
+int  lin_schedule_load(struct net_device *dev, struct sock *sk,
+		       const struct lin_schedule *sched, size_t buf_size);
+
+/**
+ * lin_schedule_delete - remove a loaded schedule
+ * @dev:    target LIN netdev
+ * @sk:     owning socket; must currently hold the master role
+ * @handle: schedule handle to delete
+ *
+ * Caller must hold ld->policy_lock. Rejects DELETE of the
+ * currently-active handle with -EBUSY (the caller must stop first)
+ * and DELETE of an unloaded handle with -ENOENT. Calls the driver's
+ * schedule_delete op first; only on success does the core clear
+ * ld->schedules_loaded[handle].
+ */
+int  lin_schedule_delete(struct net_device *dev, struct sock *sk,
+			 u8 handle);
+
+/**
+ * lin_schedule_activate - begin running a loaded schedule
+ * @dev:    target LIN netdev
+ * @sk:     owning socket; must currently hold the master role
+ * @handle: schedule handle to activate
+ *
+ * Caller must hold ld->policy_lock. Verifies @handle is loaded
+ * (returns -ENOENT otherwise) and then synchronously dispatches the
+ * swap via the driver's schedule_activate op, which blocks until the
+ * previously-active schedule (if any) has completed its in-flight
+ * slot and the new schedule is running. Sporadic-publisher presence
+ * is validated at lin_schedule_load() time, not here.
+ *
+ * Idempotent: activating the currently-active handle returns 0 with
+ * no driver op invoked, no wait, no state change.
+ *
+ * On successful return the previous schedule is fully inactive on
+ * the wire, so a subsequent LIN_RAW_SCHEDULE_LOAD on the previously-
+ * active handle is race-free. Bounded by one slot duration of the
+ * prior schedule (typically 10-50 ms).
+ */
+int  lin_schedule_activate(struct net_device *dev, struct sock *sk,
+			   u8 handle);
+
+/**
+ * lin_schedule_stop - stop the currently-active schedule
+ * @dev: target LIN netdev
+ * @sk:  owning socket; must currently hold the master role
+ *
+ * Caller must hold ld->policy_lock. Calls the driver's schedule_stop
+ * op and, on success, clears ld->active_schedule. Returns 0 when no
+ * schedule is active.
+ */
+int  lin_schedule_stop(struct net_device *dev, struct sock *sk);
+
+/**
+ * lin_schedule_release_all - force-release all schedule state for @sk
+ * @dev: target LIN netdev
+ * @sk:  socket whose schedule state is being forcibly released
+ *
+ * Caller must hold ld->policy_lock. Intended for teardown paths
+ * (socket close, NETDEV_UNREGISTER, bind-away, master release).
+ * Issues schedule_stop (if an active schedule exists) and
+ * schedule_delete for every loaded handle on a best-effort basis,
+ * logging driver failures. Always clears core-side tracking state
+ * when done.
+ */
+void lin_schedule_release_all(struct net_device *dev, struct sock *sk);
 
 #endif /* !_LIN_CORE_H */

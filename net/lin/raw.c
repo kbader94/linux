@@ -13,8 +13,9 @@
  * LIN_RAW_RECV_OWN_MSGS) plus bind(), getname(), the notifier that
  * tears down bound sockets when their netdev disappears, the
  * LIN_RAW_MASTER role-claim sockopt, LIN_RAW_PUBLISH / LIN_RAW_UNPUBLISH,
- * and the sendmsg()/write() publisher-upsert data plane. The schedule
- * and send-header sockopts land in later commits.
+ * the sendmsg()/write() publisher-upsert data plane, and the
+ * LIN_RAW_SCHEDULE_{LOAD,DELETE,ACTIVATE,STOP} master-schedule
+ * sockopts. The send-header sockopt lands in a later commit.
  */
 
 #include <linux/if_arp.h>
@@ -1107,6 +1108,212 @@ out:
 	return err;
 }
 
+/* LIN_RAW_SCHEDULE_LOAD: upload (or replace) a schedule.
+ * Argument is a variable-length struct lin_schedule.
+ */
+static int lin_raw_set_schedule_load(struct sock *sk, sockptr_t optval,
+				     unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_schedule *sched;
+	struct lin_dev *ld;
+	size_t max_bytes;
+	int err;
+
+	if (optlen < sizeof(*sched))
+		return -EINVAL;
+	max_bytes = sizeof(*sched) +
+		    (size_t)LIN_RAW_SCHEDULE_ENTRIES_MAX *
+		    sizeof(struct lin_schedule_entry);
+	if (optlen > max_bytes)
+		return -EINVAL;
+
+	sched = memdup_sockptr(optval, optlen);
+	if (IS_ERR(sched))
+		return PTR_ERR(sched);
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ro->is_master) {
+		err = -EPERM;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_schedule_load(ro->dev, sk, sched, optlen);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	kfree(sched);
+	return err;
+}
+
+/* LIN_RAW_SCHEDULE_DELETE: remove a loaded schedule by handle. */
+static int lin_raw_set_schedule_delete(struct sock *sk, sockptr_t optval,
+				       unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int handle, err;
+
+	if (optlen != sizeof(handle))
+		return -EINVAL;
+	if (copy_from_sockptr(&handle, optval, sizeof(handle)))
+		return -EFAULT;
+	if (handle < 0 || handle >= LIN_RAW_SCHEDULES_MAX)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ro->is_master) {
+		err = -EPERM;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_schedule_delete(ro->dev, sk, (u8)handle);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
+/* LIN_RAW_SCHEDULE_ACTIVATE: start running a loaded schedule. */
+static int lin_raw_set_schedule_activate(struct sock *sk, sockptr_t optval,
+					 unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int handle, err;
+
+	if (optlen != sizeof(handle))
+		return -EINVAL;
+	if (copy_from_sockptr(&handle, optval, sizeof(handle)))
+		return -EFAULT;
+	if (handle < 0 || handle >= LIN_RAW_SCHEDULES_MAX)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ro->is_master) {
+		err = -EPERM;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_schedule_activate(ro->dev, sk, (u8)handle);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
+/* LIN_RAW_SCHEDULE_STOP: stop the currently-active schedule. */
+static int lin_raw_set_schedule_stop(struct sock *sk, sockptr_t optval,
+				     unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int err;
+
+	/* No-argument sockopt: require optlen == 0 strictly. Accepting
+	 * garbage would foreclose forward-compat extensions.
+	 */
+	(void)optval;
+	if (optlen != 0)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ro->is_master) {
+		err = -EPERM;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_schedule_stop(ro->dev, sk);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
 static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 			      sockptr_t optval, unsigned int optlen)
 {
@@ -1130,6 +1337,14 @@ static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 		return lin_raw_set_publish(sk, optval, optlen);
 	case LIN_RAW_UNPUBLISH:
 		return lin_raw_set_unpublish(sk, optval, optlen);
+	case LIN_RAW_SCHEDULE_LOAD:
+		return lin_raw_set_schedule_load(sk, optval, optlen);
+	case LIN_RAW_SCHEDULE_DELETE:
+		return lin_raw_set_schedule_delete(sk, optval, optlen);
+	case LIN_RAW_SCHEDULE_ACTIVATE:
+		return lin_raw_set_schedule_activate(sk, optval, optlen);
+	case LIN_RAW_SCHEDULE_STOP:
+		return lin_raw_set_schedule_stop(sk, optval, optlen);
 	default:
 		return -ENOPROTOOPT;
 	}

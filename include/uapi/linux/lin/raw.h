@@ -442,9 +442,11 @@ struct lin_schedule_entry {
  * driver, which stores it in its own (often hardware-backed) schedule
  * table and executes it. Schedule ownership is tracked by the LIN core
  * per loading socket: entries are released when the socket is closed
- * or the master role is released. Loading a schedule while one is
- * active is permitted; the currently-running schedule is unaffected
- * until LIN_RAW_SCHEDULE_ACTIVATE selects a different handle.
+ * or the master role is released. Loading is permitted while a
+ * different handle is active — the running schedule is unaffected,
+ * and LIN_RAW_SCHEDULE_ACTIVATE switches to the new one. Loading
+ * over the currently-active handle returns -EBUSY: callers must
+ * LIN_RAW_SCHEDULE_STOP first, load, and re-activate.
  *
  * Validation at LOAD time (fail-fast):
  *   - Structural: handle / entry_count / member_count ranges,

@@ -262,6 +262,15 @@ enum {
  *
  *   write(fd, &frame, sizeof(frame));
  *
+ * NOTE - deliberate ABI departure from CAN_RAW: write()/sendmsg() does
+ * NOT put a frame on the bus. On a LIN bus the master schedule decides
+ * when a frame's header is sent; a publisher only supplies the response
+ * bytes. So write() here installs or refreshes this socket's sticky
+ * response for frame.lin_id (identical to LIN_RAW_PUBLISH), and those
+ * bytes are transmitted later, when the running schedule reaches that
+ * ID. CAN_RAW-style tooling that assumes one write() == one frame on the
+ * wire must be adapted to LIN's scheduler-owned data plane.
+ *
  * On success, registers this socket as publisher for frame.lin_id
  * with the frame's data (if no publisher exists), or updates the
  * stored response bytes in place (if this socket already owns it).

@@ -56,5 +56,20 @@
 					 * supported in addition to the
 					 * mandatory classic checksum
 					 */
+#define LIN_CAP_PUB_SLAVE	0x20	/* driver can meet the LIN spec's
+					 * header-RX -> response-TX timing
+					 * for the slave-only publisher
+					 * role (~40 character times, ~20 ms
+					 * at 19200 baud / ~4 ms at 10417).
+					 * Required for LIN_RAW_PUBLISH from
+					 * a socket that does NOT hold
+					 * LIN_RAW_MASTER; the LIN core
+					 * returns -EOPNOTSUPP otherwise.
+					 * Master-with-publish path (a socket
+					 * holding LIN_RAW_MASTER also
+					 * registering a publisher) sits on
+					 * the same TX path as the schedule
+					 * and is exempt from this cap.
+					 */
 
 #endif /* _UAPI_LIN_NETLINK_H */

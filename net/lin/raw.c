@@ -11,9 +11,10 @@
  * bind/publish/master sockopts scope per ifindex. Implements the rx
  * side (LIN_RAW_FILTER, LIN_RAW_ERR_FILTER, LIN_RAW_JOIN_FILTERS,
  * LIN_RAW_RECV_OWN_MSGS) plus bind(), getname(), the notifier that
- * tears down bound sockets when their netdev disappears, and the
- * LIN_RAW_MASTER role-claim sockopt. The publisher / schedule /
- * send-header sockopts land in later commits.
+ * tears down bound sockets when their netdev disappears, the
+ * LIN_RAW_MASTER role-claim sockopt, LIN_RAW_PUBLISH / LIN_RAW_UNPUBLISH,
+ * and the sendmsg()/write() publisher-upsert data plane. The schedule
+ * and send-header sockopts land in later commits.
  */
 
 #include <linux/if_arp.h>
@@ -271,7 +272,7 @@ static void lin_raw_disable_allfilters(struct net *net,
 }
 
 /* Release this socket's per-bus policy state on @dev: the master claim
- * (publisher entries are added with the publisher registry). Shared by
+ * and any publisher entries it owns. Shared by
  * close(), rebind, and the GOING_DOWN / UNREGISTER notifiers so every
  * teardown path drops the same driver-side ownership — otherwise a path
  * that forgets it (as the rebind path originally did) leaves the core's
@@ -298,6 +299,7 @@ static void lin_raw_drop_dev_policy(struct lin_raw_sock *ro,
 		lin_master_release(dev, sk);
 		ro->is_master = 0;
 	}
+	lin_publisher_release_all(dev, sk);
 	mutex_unlock(&ld->policy_lock);
 }
 
@@ -358,10 +360,10 @@ static void lin_raw_notify(struct lin_raw_sock *ro, unsigned long msg,
 		 * set ld->going_down under policy_lock, so any sockopt
 		 * blocked on the lock will see -ENETDOWN on wakeup before
 		 * touching the driver. Our job here is the per-socket
-		 * teardown: drop the master claim while the driver is
-		 * still alive. Filters, binding, and the netdev reference
-		 * survive so the socket remains usable as a passive
-		 * observer when the interface returns.
+		 * teardown: drop the master claim and publisher entries
+		 * while the driver is still alive. Filters, binding, and
+		 * the netdev reference survive so the socket remains
+		 * usable as a passive observer when the interface returns.
 		 */
 		lock_sock(sk);
 		if (ro->bound)
@@ -968,6 +970,143 @@ out:
 	return err;
 }
 
+/* Publisher registration helpers — shared between LIN_RAW_PUBLISH /
+ * LIN_RAW_UNPUBLISH sockopts and the sendmsg() upsert path. All assume
+ * lock_sock(sk) and ld->policy_lock are held.
+ */
+
+static int lin_raw_do_publish(struct sock *sk, u8 lin_id, const u8 *data,
+			      u8 len, bool enh)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+
+	if (!ro->bound || !ro->dev)
+		return -EOPNOTSUPP;
+	if (ro->dev->reg_state != NETREG_REGISTERED)
+		return -ENODEV;
+
+	return lin_publisher_set(ro->dev, sk, lin_id, data, len, enh);
+}
+
+static int lin_raw_do_unpublish(struct sock *sk, u8 lin_id)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+
+	if (!ro->bound || !ro->dev)
+		return -EOPNOTSUPP;
+	if (lin_id > LIN_ID_MASK)
+		return -EINVAL;
+
+	/* lin_publisher_clear() returns -ENOENT if @sk is not the
+	 * current owner of @lin_id, or propagates the driver's
+	 * clear_response() errno on failure. We surface either back to
+	 * userspace as-is.
+	 */
+	return lin_publisher_clear(ro->dev, sk, lin_id);
+}
+
+/* LIN_RAW_PUBLISH: register / update a publisher entry. */
+
+static int lin_raw_set_publish(struct sock *sk, sockptr_t optval,
+			       unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_publish pub;
+	struct lin_dev *ld;
+	int err;
+
+	if (optlen != sizeof(pub))
+		return -EINVAL;
+	if (copy_from_sockptr(&pub, optval, sizeof(pub)))
+		return -EFAULT;
+
+	if (pub.lin_id > LIN_ID_MASK)
+		return -EINVAL;
+	if (memchr_inv(pub.__res, 0, sizeof(pub.__res)))
+		return -EINVAL;
+	if (pub.flags & ~LIN_F_CHK_ENH)
+		return -EINVAL;
+	if (!pub.len || pub.len > LIN_MAX_DLEN)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_raw_do_publish(sk, pub.lin_id, pub.data, pub.len,
+				 !!(pub.flags & LIN_F_CHK_ENH));
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
+/* LIN_RAW_UNPUBLISH: release a publisher entry by LIN ID. */
+
+static int lin_raw_set_unpublish(struct sock *sk, sockptr_t optval,
+				 unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int id, err;
+
+	if (optlen != sizeof(id))
+		return -EINVAL;
+	if (copy_from_sockptr(&id, optval, sizeof(id)))
+		return -EFAULT;
+
+	if (id < 0 || id > LIN_ID_MASK)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_raw_do_unpublish(sk, (u8)id);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
 static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 			      sockptr_t optval, unsigned int optlen)
 {
@@ -987,6 +1126,10 @@ static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 		return lin_raw_set_flag(sk, optname, optval, optlen);
 	case LIN_RAW_MASTER:
 		return lin_raw_set_master(sk, optval, optlen);
+	case LIN_RAW_PUBLISH:
+		return lin_raw_set_publish(sk, optval, optlen);
+	case LIN_RAW_UNPUBLISH:
+		return lin_raw_set_unpublish(sk, optval, optlen);
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -1115,6 +1258,101 @@ static int lin_raw_recvmsg(struct socket *sock, struct msghdr *msg,
 	return size;
 }
 
+/* sendmsg / write: upsert a publisher entry for frame.lin_id.
+ * Functionally identical to LIN_RAW_PUBLISH with the frame's content,
+ * plus the ergonomic benefit of per-sample updates via write(2).
+ */
+
+static int lin_raw_sendmsg(struct socket *sock, struct msghdr *msg,
+			   size_t size)
+{
+	struct sock *sk = sock->sk;
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	struct lin_frame frame;
+	int err;
+
+	if (size != sizeof(frame))
+		return -EINVAL;
+	if (copy_from_iter(&frame, sizeof(frame), &msg->msg_iter) !=
+	    sizeof(frame))
+		return -EFAULT;
+
+	if (frame.__pad)
+		return -EINVAL;
+	if (memchr_inv(frame.__res, 0, sizeof(frame.__res)))
+		return -EINVAL;
+	if (frame.flags & LIN_F_ERR)
+		return -EINVAL;
+	if (frame.flags & ~LIN_F_CHK_ENH)
+		return -EINVAL;
+	if (frame.lin_id > LIN_ID_MASK)
+		return -EINVAL;
+	if (!frame.len || frame.len > LIN_MAX_DLEN)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	/* sendto() / sendmsg() with a non-NULL msg_name: validate AF_LIN
+	 * and require lin_ifindex == ro->ifindex. Performed under
+	 * lock_sock so the comparison sees a consistent snapshot of
+	 * ro->ifindex; the same lock serialises us against bind(),
+	 * which mutates ro->ifindex / ro->dev under it. Cross-interface
+	 * publisher upsert is not supported — the operation always
+	 * targets the bound dev — so a mismatched ifindex is a userspace
+	 * bug, not a retarget. fork() / dup() shared-fd callers are
+	 * covered here: a concurrent bind() from a sibling thread runs
+	 * under the same lock_sock, so it cannot tear ro->ifindex out
+	 * from under us between this check and the publish below.
+	 */
+	if (msg->msg_name) {
+		struct sockaddr_lin *addr = (struct sockaddr_lin *)msg->msg_name;
+
+		if (msg->msg_namelen < LIN_RAW_MIN_NAMELEN) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (addr->lin_family != AF_LIN) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (addr->lin_ifindex != ro->ifindex) {
+			err = -EINVAL;
+			goto out;
+		}
+	}
+
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_raw_do_publish(sk, frame.lin_id, frame.data, frame.len,
+				 !!(frame.flags & LIN_F_CHK_ENH));
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+
+	return err ?: (int)size;
+}
+
 static const struct proto_ops lin_raw_ops = {
 	.family		= PF_LIN,
 	.release	= lin_raw_release,
@@ -1130,7 +1368,7 @@ static const struct proto_ops lin_raw_ops = {
 	.shutdown	= sock_no_shutdown,
 	.setsockopt	= lin_raw_setsockopt,
 	.getsockopt	= lin_raw_getsockopt,
-	.sendmsg	= sock_no_sendmsg,
+	.sendmsg	= lin_raw_sendmsg,
 	.recvmsg	= lin_raw_recvmsg,
 	.mmap		= sock_no_mmap,
 };

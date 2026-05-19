@@ -180,4 +180,74 @@ int  lin_master_claim(struct net_device *dev, struct sock *sk);
  */
 int  lin_master_release(struct net_device *dev, struct sock *sk);
 
+/**
+ * lin_publisher_set - register or update a publisher for a frame ID
+ * @dev:    target LIN netdev
+ * @sk:     socket asserting publisher ownership
+ * @lin_id: 6-bit LIN frame ID
+ * @data:   response payload bytes (@len bytes)
+ * @len:    length of @data (1..LIN_MAX_DLEN)
+ * @enh:    true for enhanced checksum, false for classic
+ *
+ * Caller must hold ld->policy_lock. On first registration, takes a
+ * reference on @sk; subsequent calls by the same socket update the
+ * stored data in place. Registrations are sticky — the driver
+ * responds to every matching header until the socket explicitly
+ * clears the registration or the socket is closed.
+ *
+ * Diagnostic IDs (0x3C / 0x3D) require the driver to advertise
+ * LIN_CAP_DIAG, and must use classic checksum per LIN spec —
+ * @enh == true on 0x3C / 0x3D returns -EINVAL.
+ *
+ * Returns -EBUSY if another socket already owns @lin_id, -EOPNOTSUPP
+ * if the driver does not implement set_response (or if @lin_id is
+ * a diagnostic ID and the driver lacks LIN_CAP_DIAG), -EINVAL if
+ * @lin_id is reserved (0x3E / 0x3F), @len is out of range, or @enh
+ * is true on a diagnostic ID.
+ */
+int  lin_publisher_set(struct net_device *dev, struct sock *sk,
+		       u8 lin_id, const u8 *data, u8 len, bool enh);
+
+/**
+ * lin_publisher_clear - release a publisher registration
+ * @dev:    target LIN netdev
+ * @sk:     socket whose registration is being released
+ * @lin_id: 6-bit LIN frame ID
+ *
+ * Caller must hold ld->policy_lock. Best-effort teardown: the core
+ * publisher slot is cleared first, then the driver's clear_response op
+ * is invoked. Driver errors are logged via netdev_err but do not
+ * propagate — the slot is freed for reassignment regardless, and a
+ * subsequent set_response from a new owner overwrites any stale
+ * driver-side entry.
+ *
+ * Returns -ENOENT when @sk does not currently own @lin_id. That's
+ * distinct from a driver-side glitch: it's a userspace API contract
+ * signal ("you asked to release a publisher you don't own") and the
+ * caller can surface it to userspace as the truth — nothing was
+ * released because there was nothing to release.
+ *
+ * Return: 0 on success, -EINVAL if @lin_id is out of range,
+ *         -ENOENT if @sk does not own @lin_id.
+ */
+int  lin_publisher_clear(struct net_device *dev, struct sock *sk,
+			 u8 lin_id);
+
+/**
+ * lin_publisher_release_all - force-release every publisher registration
+ *                             owned by @sk on @dev
+ * @dev: target LIN netdev
+ * @sk:  socket whose registrations are being released
+ *
+ * Caller must hold ld->policy_lock. Iterates the per-interface
+ * publisher table and calls lin_publisher_clear() for every entry
+ * pointing at @sk. Used by teardown paths (socket close,
+ * NETDEV_UNREGISTER, bind-away) so the protocol module can free all
+ * of @sk's publisher state in one call without keeping a per-socket
+ * shadow of which IDs it owns. The iteration is bounded by
+ * LIN_ID_MASK + 1 (64 entries) and runs entirely under policy_lock,
+ * so there is no race with concurrent publisher mutations.
+ */
+void lin_publisher_release_all(struct net_device *dev, struct sock *sk);
+
 #endif /* !_LIN_CORE_H */

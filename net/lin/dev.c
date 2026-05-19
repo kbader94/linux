@@ -66,6 +66,7 @@ void lin_dev_init(struct net_device *dev, const struct lin_dev_ops *ops,
 	mutex_init(&ld->policy_lock);
 	lin_dev_rcv_lists_init(&ld->rcv_lists);
 	RCU_INIT_POINTER(ld->master_sk, NULL);
+	memset(ld->publishers, 0, sizeof(ld->publishers));
 	ld->going_down = false;
 
 	lin_set_ml_priv(dev, ld);
@@ -205,6 +206,156 @@ int lin_master_release(struct net_device *dev, struct sock *sk)
 	return 0;
 }
 EXPORT_SYMBOL(lin_master_release);
+
+int lin_publisher_set(struct net_device *dev, struct sock *sk,
+		      u8 lin_id, const u8 *data, u8 len, bool enh)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct sock *current_owner;
+	bool adding;
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (lin_id > LIN_ID_MASK)
+		return -EINVAL;
+	if (lin_id >= LIN_ID_RESERVED_FIRST)
+		return -EINVAL;
+	if (!len || len > LIN_MAX_DLEN)
+		return -EINVAL;
+	if (!ld->ops->set_response)
+		return -EOPNOTSUPP;
+
+	/* Diagnostic IDs (0x3C / 0x3D) require the driver to advertise
+	 * LIN_CAP_DIAG (the cap means "I route these IDs correctly").
+	 * Per LIN spec, diagnostic frames use classic checksum
+	 * unconditionally; enhanced checksum on 0x3C / 0x3D is a
+	 * protocol violation regardless of driver capability. This block
+	 * precedes the LIN_CAP_CHK_ENH check so the caller sees -EINVAL
+	 * (the invariant violation) rather than -EOPNOTSUPP (a misleading
+	 * driver-capability message) when both apply.
+	 */
+	if (lin_id == LIN_ID_DIAG_MASTER_REQ ||
+	    lin_id == LIN_ID_DIAG_SLAVE_RESP) {
+		if (enh)
+			return -EINVAL;
+		if (!(ld->caps & LIN_CAP_DIAG))
+			return -EOPNOTSUPP;
+	}
+
+	if (enh && !(ld->caps & LIN_CAP_CHK_ENH))
+		return -EOPNOTSUPP;
+
+	/* Slave-only publisher: requires the driver's transport to meet the
+	 * LIN spec's header-RX → response-TX timing window. A master that
+	 * also publishes its own slot responses sits on the same TX path as
+	 * the schedule and is exempt — the timing constraint only bites when
+	 * the response is triggered by an external master's incoming header.
+	 * See LIN_CAP_PUB_SLAVE in <uapi/linux/lin/netlink.h>.
+	 *
+	 * @force_pub_slave bypasses the cap check: an operator that knows
+	 * their master is permissive enough (or that they are stimulating
+	 * the slave-publisher code path for development) can set the
+	 * IFLA_LIN_FORCE_PUB_SLAVE rtnetlink attribute to admit publishers
+	 * on transports the driver did not advertise the cap for. The
+	 * resulting bus timing is the operator's problem.
+	 */
+	if (rcu_dereference_protected(ld->master_sk,
+				      lockdep_is_held(&ld->policy_lock)) != sk &&
+	    !(ld->caps & LIN_CAP_PUB_SLAVE) &&
+	    !ld->force_pub_slave)
+		return -EOPNOTSUPP;
+
+	current_owner = rcu_dereference_protected(ld->publishers[lin_id],
+						  lockdep_is_held(&ld->policy_lock));
+	if (current_owner && current_owner != sk)
+		return -EBUSY;
+
+	adding = !current_owner;
+
+	err = ld->ops->set_response(ld, lin_id, data, len, enh);
+	if (err)
+		return err;
+
+	if (adding) {
+		sock_hold(sk);
+		rcu_assign_pointer(ld->publishers[lin_id], sk);
+	}
+	return 0;
+}
+EXPORT_SYMBOL(lin_publisher_set);
+
+int lin_publisher_clear(struct net_device *dev, struct sock *sk,
+			u8 lin_id)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct sock *current_owner;
+	int err;
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (lin_id > LIN_ID_MASK)
+		return -EINVAL;
+
+	current_owner = rcu_dereference_protected(ld->publishers[lin_id],
+						  lockdep_is_held(&ld->policy_lock));
+	if (current_owner != sk)
+		return -ENOENT;
+
+	/* Best-effort teardown: clear the core slot BEFORE calling the
+	 * driver. This guarantees the per-ID slot is freed for
+	 * reassignment regardless of the driver's success, at the cost
+	 * of allowing the hardware response-table entry to outlive the
+	 * core registration if the driver fails. Concurrent re-publishers
+	 * on the same ID are not at risk because policy_lock serialises
+	 * all publisher mutations, and a subsequent set_response from a
+	 * new owner will overwrite any stale driver-side entry.
+	 *
+	 * Driver errors are logged via netdev_err rather than propagated:
+	 * the only meaningful userspace response to "clear failed" would
+	 * be retry-or-close, and both converge on the same core-slot-
+	 * freed state we already provide. dmesg is the right channel for
+	 * the operator / driver author to act on.
+	 */
+	rcu_assign_pointer(ld->publishers[lin_id], NULL);
+
+	err = ld->ops->clear_response(ld, lin_id);
+	if (err)
+		netdev_err(dev, "LIN clear_response for ID 0x%02x returned %d on release; driver may still hold stale response\n",
+			   lin_id, err);
+
+	sock_put(current_owner);
+	return 0;
+}
+EXPORT_SYMBOL(lin_publisher_clear);
+
+void lin_publisher_release_all(struct net_device *dev, struct sock *sk)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	unsigned int id;
+
+	might_sleep();
+	lockdep_assert_held(&ld->policy_lock);
+
+	/* Iterate the canonical publisher table looking for entries this
+	 * socket owns. Used by teardown paths (socket close,
+	 * NETDEV_UNREGISTER, bind-away) so the protocol module doesn't
+	 * have to maintain a shadow per-socket bitmap.
+	 *
+	 * Iteration is bounded and cheap; the per-publisher driver op
+	 * dominates the cost.
+	 */
+	for (id = 0; id <= LIN_ID_MASK; id++) {
+		if (rcu_dereference_protected(ld->publishers[id],
+					      lockdep_is_held(&ld->policy_lock)) == sk)
+			lin_publisher_clear(dev, sk, id);
+	}
+}
+EXPORT_SYMBOL(lin_publisher_release_all);
 
 int lin_register_netdev(struct net_device *dev)
 {

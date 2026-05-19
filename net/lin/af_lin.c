@@ -521,7 +521,6 @@ static void lin_receive(struct sk_buff *skb, struct net_device *dev)
 
 	consume_skb(skb);
 }
-
 /* af_lin rx packet type handler */
 
 static int lin_rcv(struct sk_buff *skb, struct net_device *dev,

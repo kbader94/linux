@@ -115,7 +115,9 @@
  */
 enum {
 	/* CAN_RAW parity: */
-	LIN_RAW_FILTER = 1,		/* 0..n struct lin_filter              */
+	LIN_RAW_FILTER = 1,		/* 0..n struct lin_filter; 0 clears
+					 * (receive no data frames)
+					 */
 	LIN_RAW_ERR_FILTER,		/* error frame subscription mask       */
 	LIN_RAW_LOOPBACK,		/* core synthesises rx for own master /
 					 * publisher emissions (default on)

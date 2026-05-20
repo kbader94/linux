@@ -58,6 +58,7 @@ void lin_dev_init(struct net_device *dev, int sizeof_priv)
 
 	ld->dev = dev;
 	mutex_init(&ld->policy_lock);
+	lin_dev_rcv_lists_init(&ld->rcv_lists);
 
 	lin_set_ml_priv(dev, ld);
 }
@@ -87,6 +88,21 @@ struct net_device *alloc_lindev(int sizeof_priv)
 	return dev;
 }
 EXPORT_SYMBOL(alloc_lindev);
+
+void lin_dev_rcv_lists_init(struct lin_dev_rcv_lists *rl)
+{
+	int i;
+
+	for (i = 0; i <= LIN_ID_MASK; i++)
+		INIT_HLIST_HEAD(&rl->by_id[i]);
+
+	INIT_HLIST_HEAD(&rl->match_all);
+	INIT_HLIST_HEAD(&rl->filter);
+	INIT_HLIST_HEAD(&rl->inv);
+	INIT_HLIST_HEAD(&rl->err);
+	rl->entries = 0;
+}
+EXPORT_SYMBOL(lin_dev_rcv_lists_init);
 
 void free_lindev(struct net_device *dev)
 {

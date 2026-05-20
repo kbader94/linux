@@ -13,9 +13,56 @@
 
 #include <linux/if_ether.h>
 #include <linux/skbuff.h>
+#include <linux/stddef.h>
 #include <linux/string.h>
+#include <linux/types.h>
 #include <linux/lin.h>
 #include <linux/lin/error.h>
+
+/**
+ * struct lin_skb_priv - per-skb private data for LIN frames
+ * @ifindex:         originating interface ifindex; drivers may populate
+ *                   this before pushing the skb up via netif_rx()
+ * @skbcnt:          monotonically-increasing identifier stamped by the
+ *                   LIN core on rx so protocol modules can deduplicate
+ *                   a single frame across overlapping filter matches
+ * @master_owner:    for loopback-synthesised skbs, points to the sock
+ *                   whose master claim sourced the header. NULL on
+ *                   bus-sourced rx and when the master role wasn't
+ *                   used to drive this frame. Held by reference for
+ *                   the skb's lifetime.
+ * @publisher_owner: for loopback-synthesised skbs, points to the sock
+ *                   whose publisher registration sourced the response
+ *                   data. NULL on bus-sourced rx and on read
+ *                   transactions where the master emitted only a
+ *                   header (slave-supplied response). Held by
+ *                   reference for the skb's lifetime.
+ *
+ * Lives in skb->cb during core→protocol dispatch. Protocols that need
+ * skb->cb for their own purposes (e.g. LIN_RAW stuffs a sockaddr_lin
+ * into the cloned skb before enqueuing for recvmsg) must do so on a
+ * cloned skb rather than the shared dispatch skb.
+ *
+ * The owner pointers are set only by lin_loopback_rx() at synthesis
+ * time and consumed by protocol rx paths to honour
+ * LIN_RAW_RECV_OWN_MSGS. Keeping them in skb->cb (rather than
+ * looking up ld->master_sk / ld->publishers[id] at dispatch time)
+ * pins provenance to the moment of emission, so role transitions
+ * during observation cannot mis-classify a frame as own / not-own.
+ */
+struct lin_skb_priv {
+	int		ifindex;
+	__u32		skbcnt;
+	struct sock	*master_owner;
+	struct sock	*publisher_owner;
+};
+
+static inline struct lin_skb_priv *lin_skb_prv(struct sk_buff *skb)
+{
+	BUILD_BUG_ON(sizeof(struct lin_skb_priv) >
+		     sizeof_field(struct sk_buff, cb));
+	return (struct lin_skb_priv *)skb->cb;
+}
 
 /**
  * lin_is_lin_skb - validate that an skb carries a well-formed LIN frame
@@ -72,6 +119,8 @@ static inline bool lin_is_lin_skb(const struct sk_buff *skb)
 		if (lf->err_mask)
 			return false;
 		if (lf->lin_id & ~LIN_ID_MASK)
+			return false;
+		if (lf->lin_id >= LIN_ID_RESERVED_FIRST)
 			return false;
 		if (lf->len < 1)
 			return false;

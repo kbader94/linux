@@ -12,6 +12,7 @@
 #define _LIN_DEV_H
 
 #include <linux/lin.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/types.h>
@@ -41,8 +42,43 @@ enum lin_emit_flags {
 };
 
 /**
+ * struct lin_dev_rcv_lists - per-interface rx subscriber lists
+ * @by_id:     one bucket per 6-bit LIN ID for single-ID filters
+ *             (id_mask == LIN_ID_MASK, no flag constraint). LIN's
+ *             ID space is small enough that a direct array index is
+ *             both simpler and faster than a hash bucket; this is the
+ *             primary deviation from SocketCAN's receiver-list shape.
+ * @match_all: subscribers with id_mask == 0 and flags_mask == 0
+ *             (and LIN_FILT_INV clear) — every non-error frame is
+ *             delivered to these.
+ * @filter:    subscribers with non-trivial id_mask or flags_mask
+ *             (non-inverted). Walked against every non-error frame.
+ * @inv:       inverted filters (LIN_FILT_INV set in lin_filter.flags).
+ *             Walked against every non-error frame, match inverted.
+ * @err:       subscribers to error frames, registered via
+ *             LIN_RAW_ERR_FILTER. Match is against frame.err_mask.
+ * @entries:   total subscriber count across all buckets; used for the
+ *             fast "no listeners" rx early-exit.
+ *
+ * Present once per LIN netdev (embedded in struct lin_dev) and once
+ * per network namespace (for ifindex-0 "any" subscribers). Readers
+ * walk the lists under rcu_read_lock(); writers update under the
+ * net-ns-wide rcvlists_lock.
+ */
+struct lin_dev_rcv_lists {
+	struct hlist_head	by_id[LIN_ID_MASK + 1];
+	struct hlist_head	match_all;
+	struct hlist_head	filter;
+	struct hlist_head	inv;
+	struct hlist_head	err;
+	int			entries;
+};
+
+/**
  * struct lin_dev - per-netdev LIN state owned by the core
  * @dev:         backpointer to the owning net_device
+ * @rcv_lists:   rx subscriber lists for this interface; see
+ *               struct lin_dev_rcv_lists
  * @policy_lock: serialises mutation of cross-socket policy state on
  *               this interface (master claim, publisher registry,
  *               schedules — added by later commits). Held across
@@ -54,21 +90,20 @@ enum lin_emit_flags {
  *
  * Installed on net_device.ml_priv with type tag ML_PRIV_LIN by
  * alloc_lindev(). Subsequent commits extend this structure with the
- * per-interface state the core must own:
- *
- *   * rx subscriber lists (filter dispatch)            — commit #4
- *   * master-role claim                                — commit #5
- *   * publisher registry and response-table state      — commit #5
- *   * loaded schedules and schedule-engine run state   — commit #6
- *
- * @policy_lock is added here as the infrastructure those later
- * policy fields rely on; it sits unused until the first helpers that
- * take it land in commit #5.
+ * cross-socket policy state the LIN core tracks: master-role claim
+ * (commit #5), publisher-ownership registry (commit #5), and loaded
+ * schedule tracking (commit #6). The actual schedule execution and
+ * hardware response table live in the driver; the core forwards
+ * validated state to it via struct lin_dev_ops.
  */
 struct lin_dev {
-	struct net_device	*dev;
-	struct mutex		 policy_lock;
+	struct net_device		*dev;
+	struct lin_dev_rcv_lists	 rcv_lists;
+	struct mutex			 policy_lock;
 };
+
+/* Initialize a struct lin_dev_rcv_lists in place. */
+void lin_dev_rcv_lists_init(struct lin_dev_rcv_lists *rl);
 
 static inline struct lin_dev *lin_get_ml_priv(struct net_device *dev)
 {

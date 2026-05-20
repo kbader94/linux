@@ -6,7 +6,9 @@
  * Author: Kyle Bader <kyle.bader94@gmail.com>
  * Copyright (c) 2026 Kyle Bader
  *
- * Modelled on net/can/af_can.c.
+ * Modelled on net/can/af_can.c, with a LIN-native rx filter table:
+ * LIN's 6-bit frame ID space is small enough to bucket subscribers
+ * directly into a 64-slot array rather than CAN's id/mask hashlists.
  */
 
 #include <linux/if_arp.h>
@@ -19,6 +21,7 @@
 #include <linux/netdevice.h>
 #include <linux/rcupdate.h>
 #include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/stddef.h>
 #include <linux/lin.h>
@@ -26,6 +29,7 @@
 #include <linux/lin/dev.h>
 #include <linux/lin/skb.h>
 #include <net/net_namespace.h>
+#include <net/netns/generic.h>
 #include <net/sock.h>
 
 MODULE_DESCRIPTION("Local Interconnect Network PF_LIN core");
@@ -37,6 +41,56 @@ MODULE_ALIAS_NETPROTO(PF_LIN);
 /* Table of registered LIN protocols, indexed by protocol id. */
 static const struct lin_proto __rcu *proto_tab[LIN_NPROTO] __read_mostly;
 static DEFINE_MUTEX(proto_tab_lock);
+
+/* Monotonic counter used to stamp lin_skb_priv.skbcnt on rx so
+ * protocol modules can deduplicate a single frame across overlapping
+ * filter matches (see struct lin_uniqframe in raw.c).
+ */
+static atomic_t lin_skbcounter = ATOMIC_INIT(0);
+
+/* Per-socket subscription entry. Lives in a hlist on either a
+ * lin_dev->rcv_lists bucket (for ifindex-bound subscriptions) or on
+ * the per-netns all-devices rcv_lists (for ifindex-0 bound sockets).
+ * Shared by all LIN protocol modules; lin_rx_register() allocates it
+ * and lin_rx_unregister() releases it via call_rcu.
+ */
+struct lin_receiver {
+	struct hlist_node	list;
+	struct rcu_head		rcu;
+	struct sock		*sk;
+
+	u8			lin_id;
+	u8			id_mask;
+	u8			flags;		/* LIN_F_* match bits */
+	u8			flags_mask;
+	u32			err_mask;	/* 0 => data-frame filter */
+
+	void			(*func)(struct sk_buff *skb, void *data);
+	void			*data;
+	const char		*ident;
+	unsigned long		matches;
+};
+
+/* Per-network-namespace state. Holds the "ifindex=0" subscriber lists
+ * and a single lock guarding rcv_lists mutations across every LIN
+ * netdev in this namespace.
+ */
+struct lin_pernet {
+	struct lin_dev_rcv_lists	rx_alldev_list;
+	/* serialises rcv-list mutations across every LIN netdev in this
+	 * namespace; rx walkers iterate the lists under rcu_read_lock().
+	 */
+	spinlock_t			rcvlists_lock;
+};
+
+static unsigned int lin_pernet_id __read_mostly;
+
+static inline struct lin_pernet *lin_pernet(struct net *net)
+{
+	return net_generic(net, lin_pernet_id);
+}
+
+static struct kmem_cache *lin_rcv_cache __read_mostly;
 
 /* af_lin socket helpers */
 
@@ -219,6 +273,255 @@ void lin_proto_unregister(const struct lin_proto *lp)
 }
 EXPORT_SYMBOL(lin_proto_unregister);
 
+/* rx subscription list management */
+
+static struct lin_dev_rcv_lists *
+lin_find_rcv_lists(struct net *net, struct net_device *dev)
+{
+	if (dev)
+		return &lin_get_ml_priv(dev)->rcv_lists;
+
+	return &lin_pernet(net)->rx_alldev_list;
+}
+
+/* Pick the bucket for a new receiver based on its filter shape. */
+static struct hlist_head *
+lin_rcv_bucket(struct lin_dev_rcv_lists *rl, __u8 *lin_id, __u8 *id_mask,
+	       __u8 *flags, __u8 flags_mask, __u32 err_mask)
+{
+	bool inv = *flags & LIN_FILT_INV;
+
+	/* strip the routing bit so match comparisons use only LIN_F_* */
+	*flags &= ~LIN_FILT_INV;
+
+	if (err_mask)
+		return &rl->err;
+
+	if (inv)
+		return &rl->inv;
+
+	/* normalize the ID to the masked bits so by_id lookups are stable */
+	*lin_id &= *id_mask;
+
+	/* Single-ID filters land in by_id[]; the dispatch walker there
+	 * also checks flags_mask so flag-constrained single-ID filters
+	 * behave correctly.
+	 */
+	if (*id_mask == LIN_ID_MASK)
+		return &rl->by_id[*lin_id & LIN_ID_MASK];
+
+	/* Only filters that impose no constraint at all go in match_all,
+	 * because the match_all walker performs unconditional delivery.
+	 * Anything with a flags_mask constraint must land in the generic
+	 * filter bucket so the walker checks flags.
+	 */
+	if (*id_mask == 0 && flags_mask == 0)
+		return &rl->match_all;
+
+	return &rl->filter;
+}
+
+int lin_rx_register(struct net *net, struct net_device *dev,
+		    __u8 lin_id, __u8 id_mask, __u8 flags, __u8 flags_mask,
+		    __u32 err_mask,
+		    void (*func)(struct sk_buff *, void *),
+		    void *data, const char *ident, struct sock *sk)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+	struct lin_dev_rcv_lists *rl;
+	struct hlist_head *bucket;
+	struct lin_receiver *r;
+
+	if (dev && (dev->type != ARPHRD_LIN || !lin_get_ml_priv(dev)))
+		return -ENODEV;
+	if (dev && !net_eq(net, dev_net(dev)))
+		return -ENODEV;
+
+	r = kmem_cache_alloc(lin_rcv_cache, GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+
+	spin_lock_bh(&lp->rcvlists_lock);
+
+	rl = lin_find_rcv_lists(net, dev);
+	bucket = lin_rcv_bucket(rl, &lin_id, &id_mask, &flags, flags_mask,
+				err_mask);
+
+	r->lin_id	= lin_id;
+	r->id_mask	= id_mask;
+	r->flags	= flags;
+	r->flags_mask	= flags_mask;
+	r->err_mask	= err_mask;
+	r->func		= func;
+	r->data		= data;
+	r->ident	= ident;
+	r->matches	= 0;
+	r->sk		= sk;
+
+	hlist_add_head_rcu(&r->list, bucket);
+	rl->entries++;
+
+	spin_unlock_bh(&lp->rcvlists_lock);
+	return 0;
+}
+EXPORT_SYMBOL(lin_rx_register);
+
+static void lin_rx_delete_receiver(struct rcu_head *rp)
+{
+	struct lin_receiver *r = container_of(rp, struct lin_receiver, rcu);
+	struct sock *sk = r->sk;
+
+	kmem_cache_free(lin_rcv_cache, r);
+	if (sk)
+		sock_put(sk);
+}
+
+void lin_rx_unregister(struct net *net, struct net_device *dev,
+		       __u8 lin_id, __u8 id_mask, __u8 flags, __u8 flags_mask,
+		       __u32 err_mask,
+		       void (*func)(struct sk_buff *, void *),
+		       void *data)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+	struct lin_dev_rcv_lists *rl;
+	struct hlist_head *bucket;
+	struct lin_receiver *r = NULL;
+	__u8 norm_flags = flags;
+	__u8 norm_id_mask = id_mask;
+	__u8 norm_lin_id = lin_id;
+
+	if (dev && (dev->type != ARPHRD_LIN || !lin_get_ml_priv(dev)))
+		return;
+	if (dev && !net_eq(net, dev_net(dev)))
+		return;
+
+	spin_lock_bh(&lp->rcvlists_lock);
+
+	rl = lin_find_rcv_lists(net, dev);
+	bucket = lin_rcv_bucket(rl, &norm_lin_id, &norm_id_mask, &norm_flags,
+				flags_mask, err_mask);
+
+	hlist_for_each_entry_rcu(r, bucket, list,
+				 lockdep_is_held(&lp->rcvlists_lock)) {
+		if (r->lin_id == norm_lin_id &&
+		    r->id_mask == norm_id_mask &&
+		    r->flags == norm_flags &&
+		    r->flags_mask == flags_mask &&
+		    r->err_mask == err_mask &&
+		    r->func == func &&
+		    r->data == data)
+			break;
+	}
+
+	if (WARN_ONCE(!r,
+		      "lin: receive list entry not found for dev %s, id 0x%02x, mask 0x%02x\n",
+		      LIN_DNAME(dev), lin_id, id_mask))
+		goto out;
+
+	hlist_del_rcu(&r->list);
+	if (rl->entries > 0)
+		rl->entries--;
+
+out:
+	spin_unlock_bh(&lp->rcvlists_lock);
+
+	if (r) {
+		if (r->sk)
+			sock_hold(r->sk);
+		call_rcu(&r->rcu, lin_rx_delete_receiver);
+	}
+}
+EXPORT_SYMBOL(lin_rx_unregister);
+
+/* rx dispatch */
+
+static inline void lin_deliver(struct sk_buff *skb, struct lin_receiver *r)
+{
+	r->func(skb, r->data);
+	r->matches++;
+}
+
+static int lin_rcv_filter(struct lin_dev_rcv_lists *rl, struct sk_buff *skb)
+{
+	const struct lin_frame *lf = (const struct lin_frame *)skb->data;
+	struct lin_receiver *r;
+	int matches = 0;
+
+	if (rl->entries == 0)
+		return 0;
+
+	if (lf->flags & LIN_F_ERR) {
+		hlist_for_each_entry_rcu(r, &rl->err, list) {
+			if (lf->err_mask & r->err_mask) {
+				lin_deliver(skb, r);
+				matches++;
+			}
+		}
+		return matches;
+	}
+
+	/* Single-ID bucket: every entry matches by ID; check flag constraint */
+	hlist_for_each_entry_rcu(r, &rl->by_id[lf->lin_id & LIN_ID_MASK],
+				 list) {
+		if ((lf->flags & r->flags_mask) ==
+		    (r->flags & r->flags_mask)) {
+			lin_deliver(skb, r);
+			matches++;
+		}
+	}
+
+	/* Match-all bucket: unconditional delivery */
+	hlist_for_each_entry_rcu(r, &rl->match_all, list) {
+		lin_deliver(skb, r);
+		matches++;
+	}
+
+	/* Generic mask filter */
+	hlist_for_each_entry_rcu(r, &rl->filter, list) {
+		if ((lf->lin_id & r->id_mask) ==
+		    (r->lin_id & r->id_mask) &&
+		    (lf->flags & r->flags_mask) ==
+		    (r->flags & r->flags_mask)) {
+			lin_deliver(skb, r);
+			matches++;
+		}
+	}
+
+	/* Inverted filter */
+	hlist_for_each_entry_rcu(r, &rl->inv, list) {
+		if ((lf->lin_id & r->id_mask) !=
+		    (r->lin_id & r->id_mask) ||
+		    (lf->flags & r->flags_mask) !=
+		    (r->flags & r->flags_mask)) {
+			lin_deliver(skb, r);
+			matches++;
+		}
+	}
+
+	return matches;
+}
+
+static void lin_receive(struct sk_buff *skb, struct net_device *dev)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	struct net *net = dev_net(dev);
+
+	/* Stamp a unique skb identifier so protocol rx paths can dedup
+	 * matches across overlapping filters. Drivers may pre-populate
+	 * this field (for locally-synthesised loopback); only stamp
+	 * when still zero.
+	 */
+	while (!lin_skb_prv(skb)->skbcnt)
+		lin_skb_prv(skb)->skbcnt = atomic_inc_return(&lin_skbcounter);
+
+	rcu_read_lock();
+	lin_rcv_filter(&lin_pernet(net)->rx_alldev_list, skb);
+	lin_rcv_filter(&ld->rcv_lists, skb);
+	rcu_read_unlock();
+
+	consume_skb(skb);
+}
+
 /* af_lin rx packet type handler */
 
 static int lin_rcv(struct sk_buff *skb, struct net_device *dev,
@@ -233,12 +536,58 @@ static int lin_rcv(struct sk_buff *skb, struct net_device *dev,
 		return NET_RX_DROP;
 	}
 
-	/* Subscriber dispatch (rx filter lists) is added in a subsequent
-	 * commit. Until then, validated LIN frames are consumed here.
-	 */
-	consume_skb(skb);
+	lin_receive(skb, dev);
 	return NET_RX_SUCCESS;
 }
+
+/* Pernet init / exit */
+
+static int __net_init lin_pernet_init(struct net *net)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+
+	spin_lock_init(&lp->rcvlists_lock);
+	lin_dev_rcv_lists_init(&lp->rx_alldev_list);
+	return 0;
+}
+
+static void __net_exit lin_pernet_exit(struct net *net)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+	struct lin_dev_rcv_lists *rl = &lp->rx_alldev_list;
+	unsigned int i;
+
+	/* By the time a network namespace is torn down, every socket
+	 * inside it should already be dead, and every lin_rx_register()
+	 * subscription on the all-devices list should have been matched
+	 * by a lin_rx_unregister(). A non-empty bucket here is a
+	 * subscription leak — flag it loudly so the responsible protocol
+	 * module gets fixed rather than silently leaving call_rcu-pinned
+	 * sock references stranded.
+	 */
+	for (i = 0; i <= LIN_ID_MASK; i++)
+		WARN_ONCE(!hlist_empty(&rl->by_id[i]),
+			  "PF_LIN: pernet exit with non-empty rx_alldev_list by_id[%u]\n",
+			  i);
+	WARN_ONCE(!hlist_empty(&rl->match_all),
+		  "PF_LIN: pernet exit with non-empty rx_alldev_list match_all\n");
+	WARN_ONCE(!hlist_empty(&rl->filter),
+		  "PF_LIN: pernet exit with non-empty rx_alldev_list filter\n");
+	WARN_ONCE(!hlist_empty(&rl->inv),
+		  "PF_LIN: pernet exit with non-empty rx_alldev_list inv\n");
+	WARN_ONCE(!hlist_empty(&rl->err),
+		  "PF_LIN: pernet exit with non-empty rx_alldev_list err\n");
+	WARN_ONCE(rl->entries != 0,
+		  "PF_LIN: pernet exit with rx_alldev_list entries=%d\n",
+		  rl->entries);
+}
+
+static struct pernet_operations lin_pernet_ops __read_mostly = {
+	.init	= lin_pernet_init,
+	.exit	= lin_pernet_exit,
+	.id	= &lin_pernet_id,
+	.size	= sizeof(struct lin_pernet),
+};
 
 /* af_lin module init / exit */
 
@@ -259,20 +608,40 @@ static __init int lin_init(void)
 
 	pr_debug("lin: local interconnect network core\n");
 
+	lin_rcv_cache = kmem_cache_create("lin_receiver",
+					  sizeof(struct lin_receiver),
+					  0, 0, NULL);
+	if (!lin_rcv_cache)
+		return -ENOMEM;
+
+	err = register_pernet_subsys(&lin_pernet_ops);
+	if (err)
+		goto out_cache;
+
 	err = sock_register(&lin_family_ops);
 	if (err)
-		return err;
+		goto out_pernet;
 
 	dev_add_pack(&lin_packet);
 
 	return 0;
+
+out_pernet:
+	unregister_pernet_subsys(&lin_pernet_ops);
+out_cache:
+	kmem_cache_destroy(lin_rcv_cache);
+	return err;
 }
 
 static __exit void lin_exit(void)
 {
 	dev_remove_pack(&lin_packet);
 	sock_unregister(PF_LIN);
+	unregister_pernet_subsys(&lin_pernet_ops);
+
 	rcu_barrier();
+
+	kmem_cache_destroy(lin_rcv_cache);
 }
 
 module_init(lin_init);

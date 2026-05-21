@@ -42,6 +42,7 @@ EXPORT_SYMBOL(lin_setup);
  * lin_dev_init - initialise the LIN core's embedded struct lin_dev
  * @dev:         a net_device whose private area was sized to hold the
  *               driver private region followed by struct lin_dev
+ * @ops:         driver-provided LIN ops vtable, stored on the lin_dev
  * @sizeof_priv: size of the driver private region preceding the lin_dev,
  *               in bytes (the same value passed to alloc_lindev())
  *
@@ -51,12 +52,14 @@ EXPORT_SYMBOL(lin_setup);
  * rtnl_link_ops (and therefore cannot call alloc_lindev()) can run the
  * same initialisation from their setup callback.
  */
-void lin_dev_init(struct net_device *dev, int sizeof_priv)
+void lin_dev_init(struct net_device *dev, const struct lin_dev_ops *ops,
+		  int sizeof_priv)
 {
 	struct lin_dev *ld = (struct lin_dev *)((char *)netdev_priv(dev) +
 						ALIGN(sizeof_priv, NETDEV_ALIGN));
 
 	ld->dev = dev;
+	ld->ops = ops;
 	mutex_init(&ld->policy_lock);
 	lin_dev_rcv_lists_init(&ld->rcv_lists);
 
@@ -64,10 +67,14 @@ void lin_dev_init(struct net_device *dev, int sizeof_priv)
 }
 EXPORT_SYMBOL(lin_dev_init);
 
-struct net_device *alloc_lindev(int sizeof_priv)
+struct net_device *alloc_lindev(int sizeof_priv,
+				const struct lin_dev_ops *ops)
 {
 	struct net_device *dev;
 	int size;
+
+	if (!ops)
+		return NULL;
 
 	/* Memory layout within netdev_priv():
 	 *
@@ -83,7 +90,7 @@ struct net_device *alloc_lindev(int sizeof_priv)
 	if (!dev)
 		return NULL;
 
-	lin_dev_init(dev, sizeof_priv);
+	lin_dev_init(dev, ops, sizeof_priv);
 
 	return dev;
 }
@@ -112,7 +119,53 @@ EXPORT_SYMBOL(free_lindev);
 
 int lin_register_netdev(struct net_device *dev)
 {
-	if (dev->type != ARPHRD_LIN || !lin_get_ml_priv(dev))
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+	int master_ops;
+
+	if (dev->type != ARPHRD_LIN || !ld)
+		return -EINVAL;
+
+	/* Enforce paired lifecycle ops. A driver that implements one half
+	 * of a pair but not the other would strand hardware state on
+	 * release (publisher unset without clear_response leaves the
+	 * response table entry live; master claim release without
+	 * master_stop leaves the schedule engine running). Catch it at
+	 * registration time so the driver author fixes their vtable
+	 * rather than debugging a stale-state bug later.
+	 */
+	if (!!ld->ops->set_response != !!ld->ops->clear_response)
+		return -EINVAL;
+
+	/* Master ops: master_{start,stop} and the four
+	 * schedule_* ops must be either all set or all NULL. A driver
+	 * supporting only part of the master role can't usefully run
+	 * a schedule.
+	 */
+	master_ops = !!ld->ops->master_start + !!ld->ops->master_stop +
+		     !!ld->ops->schedule_load + !!ld->ops->schedule_delete +
+		     !!ld->ops->schedule_activate + !!ld->ops->schedule_stop;
+	if (master_ops != 0 && master_ops != 6)
+		return -EINVAL;
+
+	/* Caps that imply master capability cannot be set on a
+	 * slave-only driver. LIN_CAP_CHK_ENH is allowed on either
+	 * because a slave node may also publish enhanced-checksum
+	 * frames. LIN_CAP_DIAG is also role-agnostic — it indicates
+	 * the driver handles the diagnostic ID range correctly, which
+	 * matters for both master-side schedule routing and slave-side
+	 * transport responses.
+	 */
+	if (master_ops == 0 &&
+	    (ld->caps & (LIN_CAP_SPORADIC | LIN_CAP_EVENT)))
+		return -EINVAL;
+
+	/* @header_send is the kernel's one-shot emission primitive,
+	 * reachable only from the master role (lin_header_send() requires
+	 * the caller hold the master claim). A slave-only driver that
+	 * supplies it has an unreachable op, so reject the configuration
+	 * at registration time.
+	 */
+	if (master_ops == 0 && ld->ops->header_send)
 		return -EINVAL;
 
 	/* Mark the interface as carrier-off until the driver opens it and

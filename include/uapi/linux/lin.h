@@ -88,6 +88,13 @@
 #define LIN_F_CHK_ENH	0x02	/* enhanced checksum was used on the wire
 				 * (as opposed to the classic checksum).
 				 */
+#define LIN_F_WAKEUP	0x04	/* bus-level wakeup signal (LIN 2.1+).
+				 * Carries no data and no error class —
+				 * lin_id is LIN_ID_NONE, len is 0,
+				 * err_mask is 0. Mutually exclusive with
+				 * LIN_F_ERR. Off by default; subscribe
+				 * via LIN_RAW_WAKEUP_FILTER to receive.
+				 */
 #define LIN_F_EVENT_COLLISION	0x08	/* event-triggered slot collision: the
 					 * master polled an event-triggered
 					 * frame and two or more slaves
@@ -100,8 +107,6 @@
 					 * schedule. Delivered through the normal
 					 * filter path, so subscribe by matching
 					 * the trigger ID (or match-all).
-					 * (0x04 is LIN_F_WAKEUP, added with bus
-					 * wakeup support.)
 					 */
 
 /**

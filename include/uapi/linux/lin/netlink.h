@@ -60,6 +60,14 @@
 					 * supported in addition to the
 					 * mandatory classic checksum
 					 */
+#define LIN_CAP_WAKEUP		0x10	/* bus wakeup signalling (LIN 2.1+).
+					 * Driver implements @wakeup_send for
+					 * TX, and synthesizes wakeup frames
+					 * (LIN_F_WAKEUP, lin_id=LIN_ID_NONE,
+					 * len=0) on RX detection. Role-
+					 * agnostic - any node may wake the
+					 * bus per spec.
+					 */
 #define LIN_CAP_PUB_SLAVE	0x20	/* driver can meet the LIN spec's
 					 * header-RX -> response-TX timing
 					 * for the slave-only publisher

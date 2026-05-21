@@ -433,6 +433,94 @@ out:
 }
 EXPORT_SYMBOL(lin_rx_unregister);
 
+int lin_rx_register_wakeup(struct net *net, struct net_device *dev,
+			   void (*func)(struct sk_buff *, void *),
+			   void *data, const char *ident, struct sock *sk)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+	struct lin_dev_rcv_lists *rl;
+	struct lin_receiver *r;
+
+	if (dev && (dev->type != ARPHRD_LIN || !lin_get_ml_priv(dev)))
+		return -ENODEV;
+	if (dev && !net_eq(net, dev_net(dev)))
+		return -ENODEV;
+
+	r = kmem_cache_alloc(lin_rcv_cache, GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+
+	spin_lock_bh(&lp->rcvlists_lock);
+
+	rl = lin_find_rcv_lists(net, dev);
+
+	/* Wakeup subscriptions have no filter shape — every wakeup-flagged
+	 * frame on the bound interface is delivered to every subscriber.
+	 * Zero out the filter fields so the unregister path's structural
+	 * comparison still works against future bug-prone callers.
+	 */
+	r->lin_id	= 0;
+	r->id_mask	= 0;
+	r->flags	= 0;
+	r->flags_mask	= 0;
+	r->err_mask	= 0;
+	r->func		= func;
+	r->data		= data;
+	r->ident	= ident;
+	r->matches	= 0;
+	r->sk		= sk;
+
+	hlist_add_head_rcu(&r->list, &rl->wakeup);
+	rl->entries++;
+
+	spin_unlock_bh(&lp->rcvlists_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL(lin_rx_register_wakeup);
+
+void lin_rx_unregister_wakeup(struct net *net, struct net_device *dev,
+			      void (*func)(struct sk_buff *, void *),
+			      void *data)
+{
+	struct lin_pernet *lp = lin_pernet(net);
+	struct lin_dev_rcv_lists *rl;
+	struct lin_receiver *r = NULL;
+
+	if (dev && (dev->type != ARPHRD_LIN || !lin_get_ml_priv(dev)))
+		return;
+	if (dev && !net_eq(net, dev_net(dev)))
+		return;
+
+	spin_lock_bh(&lp->rcvlists_lock);
+
+	rl = lin_find_rcv_lists(net, dev);
+
+	hlist_for_each_entry_rcu(r, &rl->wakeup, list,
+				 lockdep_is_held(&lp->rcvlists_lock)) {
+		if (r->func == func && r->data == data)
+			break;
+	}
+
+	if (WARN_ONCE(!r, "lin: wakeup-list entry not found for dev %s\n",
+		      LIN_DNAME(dev)))
+		goto out;
+
+	hlist_del_rcu(&r->list);
+	if (rl->entries > 0)
+		rl->entries--;
+
+out:
+	spin_unlock_bh(&lp->rcvlists_lock);
+
+	if (r) {
+		if (r->sk)
+			sock_hold(r->sk);
+		call_rcu(&r->rcu, lin_rx_delete_receiver);
+	}
+}
+EXPORT_SYMBOL(lin_rx_unregister_wakeup);
+
 /* rx dispatch */
 
 static inline void lin_deliver(struct sk_buff *skb, struct lin_receiver *r)
@@ -449,6 +537,18 @@ static int lin_rcv_filter(struct lin_dev_rcv_lists *rl, struct sk_buff *skb)
 
 	if (rl->entries == 0)
 		return 0;
+
+	/* Wakeup signals route exclusively to the wakeup list. They
+	 * never reach data, error, or match-all walkers — wakeup is
+	 * a distinct frame category, off-by-default in subscription.
+	 */
+	if (lf->flags & LIN_F_WAKEUP) {
+		hlist_for_each_entry_rcu(r, &rl->wakeup, list) {
+			lin_deliver(skb, r);
+			matches++;
+		}
+		return matches;
+	}
 
 	if (lf->flags & LIN_F_ERR) {
 		hlist_for_each_entry_rcu(r, &rl->err, list) {
@@ -576,6 +676,8 @@ static void __net_exit lin_pernet_exit(struct net *net)
 		  "PF_LIN: pernet exit with non-empty rx_alldev_list inv\n");
 	WARN_ONCE(!hlist_empty(&rl->err),
 		  "PF_LIN: pernet exit with non-empty rx_alldev_list err\n");
+	WARN_ONCE(!hlist_empty(&rl->wakeup),
+		  "PF_LIN: pernet exit with non-empty rx_alldev_list wakeup\n");
 	WARN_ONCE(rl->entries != 0,
 		  "PF_LIN: pernet exit with rx_alldev_list entries=%d\n",
 		  rl->entries);

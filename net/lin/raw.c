@@ -13,9 +13,10 @@
  * LIN_RAW_RECV_OWN_MSGS) plus bind(), getname(), the notifier that
  * tears down bound sockets when their netdev disappears, the
  * LIN_RAW_MASTER role-claim sockopt, LIN_RAW_PUBLISH / LIN_RAW_UNPUBLISH,
- * the sendmsg()/write() publisher-upsert data plane, and the
+ * the sendmsg()/write() publisher-upsert data plane, the
  * LIN_RAW_SCHEDULE_{LOAD,DELETE,ACTIVATE,STOP} master-schedule
- * sockopts. The send-header sockopt lands in a later commit.
+ * sockopts, and the LIN_RAW_WAKEUP / LIN_RAW_WAKEUP_FILTER / LIN_RAW_SLEEP
+ * bus-state sockopts.
  */
 
 #include <linux/if_arp.h>
@@ -75,6 +76,7 @@ struct lin_raw_sock {
 	unsigned int		bound:1;
 	unsigned int		is_master:1;	/* LIN_RAW_MASTER held */
 	unsigned int		join_filters:1;
+	unsigned int		wakeup_filter:1; /* LIN_RAW_WAKEUP_FILTER on */
 	__u32			err_mask;
 	int			count;
 	struct lin_uniqframe __percpu	*uniq;
@@ -136,14 +138,16 @@ static void lin_raw_rcv(struct sk_buff *oskb, void *data)
 	 * before delivering, so we count matches per frame and gate
 	 * delivery on join_rx_count >= ro->count.
 	 *
-	 * Error frames bypass both checks. They route through the
-	 * disjoint LIN_RAW_ERR_FILTER list, so a socket sees at most
-	 * one rx callback per error skb — dedup is unnecessary, and
-	 * applying the JOIN_FILTERS gate against ro->count (the data-
-	 * filter count) would silently suppress every error delivery
+	 * Error and wakeup frames bypass both checks. They route
+	 * through disjoint subscriber lists (LIN_RAW_ERR_FILTER /
+	 * LIN_RAW_WAKEUP_FILTER), so a socket sees at most one rx
+	 * callback per such skb — dedup is unnecessary, and applying
+	 * the JOIN_FILTERS gate against ro->count (the data-filter
+	 * count) would silently suppress every error/wakeup delivery
 	 * when ro->count > 1.
 	 */
-	if (!(((const struct lin_frame *)oskb->data)->flags & LIN_F_ERR)) {
+	if (!(((const struct lin_frame *)oskb->data)->flags &
+	      (LIN_F_ERR | LIN_F_WAKEUP))) {
 		if (this_cpu_ptr(ro->uniq)->skb == oskb &&
 		    this_cpu_ptr(ro->uniq)->skbcnt == lin_skb_prv(oskb)->skbcnt) {
 			if (!ro->join_filters)
@@ -245,6 +249,23 @@ static void lin_raw_disable_errfilter(struct net *net, struct net_device *dev,
 				  lin_raw_rcv, sk);
 }
 
+static int lin_raw_enable_wakeupfilter(struct net *net, struct net_device *dev,
+				       struct sock *sk, bool on)
+{
+	if (!on)
+		return 0;
+
+	return lin_rx_register_wakeup(net, dev, lin_raw_rcv, sk, "raw", sk);
+}
+
+static void lin_raw_disable_wakeupfilter(struct net *net,
+					 struct net_device *dev,
+					 struct sock *sk, bool on)
+{
+	if (on)
+		lin_rx_unregister_wakeup(net, dev, lin_raw_rcv, sk);
+}
+
 static int lin_raw_enable_allfilters(struct net *net, struct net_device *dev,
 				     struct sock *sk)
 {
@@ -256,8 +277,16 @@ static int lin_raw_enable_allfilters(struct net *net, struct net_device *dev,
 		return err;
 
 	err = lin_raw_enable_errfilter(net, dev, sk, ro->err_mask);
-	if (err)
+	if (err) {
 		lin_raw_disable_filters(net, dev, sk, ro->filter, ro->count);
+		return err;
+	}
+
+	err = lin_raw_enable_wakeupfilter(net, dev, sk, ro->wakeup_filter);
+	if (err) {
+		lin_raw_disable_errfilter(net, dev, sk, ro->err_mask);
+		lin_raw_disable_filters(net, dev, sk, ro->filter, ro->count);
+	}
 
 	return err;
 }
@@ -270,6 +299,7 @@ static void lin_raw_disable_allfilters(struct net *net,
 
 	lin_raw_disable_filters(net, dev, sk, ro->filter, ro->count);
 	lin_raw_disable_errfilter(net, dev, sk, ro->err_mask);
+	lin_raw_disable_wakeupfilter(net, dev, sk, ro->wakeup_filter);
 }
 
 /* Release this socket's per-bus policy state on @dev: the master claim
@@ -424,6 +454,7 @@ static int lin_raw_init(struct sock *sk)
 	ro->lin.loopback		= 1;
 	ro->lin.recv_own_msgs	= 0;
 	ro->join_filters	= 0;
+	ro->wakeup_filter	= 0;
 	ro->err_mask		= 0;
 
 	/* default filter: match every frame ID, no flag constraint */
@@ -1314,6 +1345,150 @@ out:
 	return err;
 }
 
+/* LIN_RAW_WAKEUP: drive a bus wakeup pulse. Any node may wake the bus,
+ * so no master-role gate; capability + schedule-quiescent are checked
+ * by lin_wakeup_send().
+ */
+static int lin_raw_set_wakeup(struct sock *sk, sockptr_t optval,
+			      unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int err;
+
+	/* No-argument sockopt: require optlen == 0 strictly. */
+	(void)optval;
+	if (optlen != 0)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	err = lin_wakeup_send(ro->dev);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
+/* LIN_RAW_WAKEUP_FILTER: subscribe / unsubscribe to wakeup events. */
+static int lin_raw_set_wakeup_filter(struct sock *sk, sockptr_t optval,
+				     unsigned int optlen)
+{
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct net_device *dev;
+	int flag, err = 0;
+	bool on;
+
+	if (optlen != sizeof(flag))
+		return -EINVAL;
+	if (copy_from_sockptr(&flag, optval, sizeof(flag)))
+		return -EFAULT;
+	on = !!flag;
+
+	lock_sock(sk);
+
+	dev = ro->dev;
+
+	if (ro->bound && dev && dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	if (on == !!ro->wakeup_filter)
+		goto out;	/* idempotent */
+
+	if (ro->bound) {
+		if (on) {
+			err = lin_raw_enable_wakeupfilter(sock_net(sk), dev,
+							  sk, true);
+			if (err)
+				goto out;
+		} else {
+			lin_raw_disable_wakeupfilter(sock_net(sk), dev, sk,
+						     true);
+		}
+	}
+	ro->wakeup_filter = on;
+
+out:
+	release_sock(sk);
+	return err;
+}
+
+/* LIN_RAW_SLEEP: send the LIN sleep command frame.
+ * Wraps lin_header_send with the spec-defined ID and payload.
+ */
+static int lin_raw_set_sleep(struct sock *sk, sockptr_t optval,
+			     unsigned int optlen)
+{
+	static const u8 sleep_payload[LIN_MAX_DLEN] = {
+		0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+	};
+	struct lin_raw_sock *ro = lin_raw_sk(sk);
+	struct lin_dev *ld;
+	int err;
+
+	/* No-argument sockopt: require optlen == 0 strictly. */
+	(void)optval;
+	if (optlen != 0)
+		return -EINVAL;
+
+	lock_sock(sk);
+
+	if (!ro->bound || !ro->dev) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ro->is_master) {
+		err = -EPERM;
+		goto out;
+	}
+	if (ro->dev->reg_state != NETREG_REGISTERED) {
+		err = -ENODEV;
+		goto out;
+	}
+	ld = lin_get_ml_priv(ro->dev);
+	if (!ld) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	mutex_lock(&ld->policy_lock);
+	if (!(ro->dev->flags & IFF_UP) || ld->going_down) {
+		mutex_unlock(&ld->policy_lock);
+		err = -ENETDOWN;
+		goto out;
+	}
+	/* Classic checksum per LIN spec for the sleep command. */
+	err = lin_header_send(ro->dev, sk, LIN_ID_DIAG_MASTER_REQ,
+			      sleep_payload, LIN_MAX_DLEN, false);
+	mutex_unlock(&ld->policy_lock);
+
+out:
+	release_sock(sk);
+	return err;
+}
+
 static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 			      sockptr_t optval, unsigned int optlen)
 {
@@ -1345,6 +1520,12 @@ static int lin_raw_setsockopt(struct socket *sock, int level, int optname,
 		return lin_raw_set_schedule_activate(sk, optval, optlen);
 	case LIN_RAW_SCHEDULE_STOP:
 		return lin_raw_set_schedule_stop(sk, optval, optlen);
+	case LIN_RAW_WAKEUP:
+		return lin_raw_set_wakeup(sk, optval, optlen);
+	case LIN_RAW_WAKEUP_FILTER:
+		return lin_raw_set_wakeup_filter(sk, optval, optlen);
+	case LIN_RAW_SLEEP:
+		return lin_raw_set_sleep(sk, optval, optlen);
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -1424,6 +1605,48 @@ static int lin_raw_getsockopt(struct socket *sock, int level, int optname,
 			return -EINVAL;
 		len = sizeof(int);
 		val = ro->join_filters;
+		data = &val;
+		break;
+
+	case LIN_RAW_SCHEDULE_ACTIVATE: {
+		struct lin_dev *ld;
+		int active;
+
+		if (len < sizeof(int))
+			return -EINVAL;
+
+		lock_sock(sk);
+		if (!ro->bound || !ro->dev) {
+			release_sock(sk);
+			return -EOPNOTSUPP;
+		}
+		if (ro->dev->reg_state != NETREG_REGISTERED) {
+			release_sock(sk);
+			return -ENODEV;
+		}
+		ld = lin_get_ml_priv(ro->dev);
+		if (!ld) {
+			release_sock(sk);
+			return -ENODEV;
+		}
+		mutex_lock(&ld->policy_lock);
+		active = ld->active_schedule;
+		mutex_unlock(&ld->policy_lock);
+		release_sock(sk);
+
+		len = sizeof(int);
+		if (put_user(len, optlen))
+			return -EFAULT;
+		if (copy_to_user(optval, &active, len))
+			return -EFAULT;
+		return 0;
+	}
+
+	case LIN_RAW_WAKEUP_FILTER:
+		if (len < sizeof(int))
+			return -EINVAL;
+		len = sizeof(int);
+		val = ro->wakeup_filter;
 		data = &val;
 		break;
 

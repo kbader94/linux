@@ -204,6 +204,20 @@ enum lin_emit_flags {
  *                  -ETIMEDOUT, indicating a hardware fault. Same
  *                  uninterruptible-by-signal contract as
  *                  @schedule_activate.
+ * @wakeup_send:    drive a bus wakeup pulse (dominant for 250-5000us
+ *                  per LIN 2.1+) and BLOCK until the pulse has fully
+ *                  completed on the wire. Optional; pair with
+ *                  LIN_CAP_WAKEUP. Role-agnostic — slave-only drivers
+ *                  may supply this op without the master ops.
+ *
+ *                  Drivers must implement the wait with a bounded
+ *                  timeout (the pulse is at most ~5 ms per spec; a
+ *                  ~10 ms bound leaves headroom). On timeout return
+ *                  -ETIMEDOUT. Same uninterruptible-by-signal
+ *                  contract as @schedule_activate / @header_send.
+ *                  On successful return the bus is back to recessive
+ *                  and a subsequent LIN_RAW_SCHEDULE_ACTIVATE cannot
+ *                  collide with the pulse.
  *
  * Op pairing enforced by lin_register_netdev():
  *   - @set_response / @clear_response: both or neither
@@ -217,6 +231,9 @@ enum lin_emit_flags {
  *     ops — lin_register_netdev() rejects a slave-only driver that
  *     supplies it, since lin_header_send() requires the master role
  *     and no socket can claim master without the master ops.
+ *   - @wakeup_send is optional and gated by LIN_CAP_WAKEUP. The cap
+ *     and the op must agree; no master-ops dependency since LIN
+ *     allows any node to wake the bus.
  *
  * The pairing rules above yield four valid driver configurations.
  * The master ops and the response ops (@set_response /
@@ -304,6 +321,8 @@ struct lin_dev_ops {
 
 	int (*header_send)(struct lin_dev *ld, u8 lin_id,
 			   const u8 *data, u8 len, bool enhanced_checksum);
+
+	int (*wakeup_send)(struct lin_dev *ld);
 };
 
 /**
@@ -322,6 +341,10 @@ struct lin_dev_ops {
  *             Walked against every non-error frame, match inverted.
  * @err:       subscribers to error frames, registered via
  *             LIN_RAW_ERR_FILTER. Match is against frame.err_mask.
+ * @wakeup:    subscribers to bus-level wakeup signals, registered via
+ *             LIN_RAW_WAKEUP_FILTER. Receives every frame with
+ *             LIN_F_WAKEUP set; no per-subscriber masking — wakeup
+ *             carries no class data.
  * @entries:   total subscriber count across all buckets; used for the
  *             fast "no listeners" rx early-exit.
  *
@@ -336,6 +359,7 @@ struct lin_dev_rcv_lists {
 	struct hlist_head	filter;
 	struct hlist_head	inv;
 	struct hlist_head	err;
+	struct hlist_head	wakeup;
 	int			entries;
 };
 
@@ -552,6 +576,13 @@ void lin_unregister_netdev(struct net_device *dev);
  *
  * Callable from process or softirq context. Allocates with
  * GFP_ATOMIC.
+ *
+ * Wakeup pulses (lin_dev_ops.wakeup_send) are NOT synthesised
+ * through this helper. The originating socket already knows it
+ * emitted a wakeup (its setsockopt returned), and bus-sourced
+ * wakeup detections flow through the driver's normal rx path with
+ * @master_owner / @publisher_owner left NULL. Drivers should not
+ * call lin_loopback_rx() for self-emitted wakeup pulses.
  */
 void lin_loopback_rx(struct net_device *dev, const struct lin_frame *frame,
 		     unsigned int emit_flags, u8 resp_id);

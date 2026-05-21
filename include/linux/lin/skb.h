@@ -69,14 +69,22 @@ static inline struct lin_skb_priv *lin_skb_prv(struct sk_buff *skb)
  * @skb: the skb to inspect
  *
  * Checks total length, flag-bit validity, reserved-field zeroing,
- * and the data/error-frame invariants expressed by the UAPI:
+ * and the data/error/wakeup-frame invariants expressed by the UAPI:
  *
- *   * Data frames (LIN_F_ERR clear): err_mask must be zero, lin_id
- *     must be a 6-bit ID (0..LIN_ID_MASK), len must be 1..LIN_MAX_DLEN
- *     per the LIN specification.
+ *   * Data frames (LIN_F_ERR clear, LIN_F_WAKEUP clear): err_mask must
+ *     be zero, lin_id must be a 6-bit ID (0..LIN_ID_MASK) and < 0x3E,
+ *     len must be 1..LIN_MAX_DLEN per the LIN specification, and
+ *     LIN_F_CHK_ENH MUST NOT be set when lin_id is a diagnostic ID
+ *     (LIN_ID_DIAG_MASTER_REQ / LIN_ID_DIAG_SLAVE_RESP) — diagnostic
+ *     frames use classic checksum per LIN spec, so an enhanced-checksum
+ *     diagnostic frame is a protocol violation.
  *   * Error frames (LIN_F_ERR set): err_mask must be non-zero, lin_id
  *     must be either a 6-bit ID or LIN_ID_NONE, len may be 0..LIN_MAX_DLEN
  *     (context bytes, zero when no context).
+ *   * Wakeup frames (LIN_F_WAKEUP set): mutually exclusive with
+ *     LIN_F_ERR; lin_id must be LIN_ID_NONE, len 0, err_mask 0,
+ *     and LIN_F_CHK_ENH MUST NOT be set (wakeup is bus-level signaling
+ *     with no on-wire checksum byte to be classic or enhanced).
  *
  * Called by the core on rx (lin_rcv) to keep buggy drivers and
  * forwarding paths from reaching subscriber dispatch with malformed
@@ -103,7 +111,8 @@ static inline bool lin_is_lin_skb(const struct sk_buff *skb)
 	if (memchr_inv(lf->__res, 0, sizeof(lf->__res)))
 		return false;
 
-	if (lf->flags & ~(LIN_F_ERR | LIN_F_CHK_ENH | LIN_F_EVENT_COLLISION))
+	if (lf->flags & ~(LIN_F_ERR | LIN_F_CHK_ENH | LIN_F_WAKEUP |
+			  LIN_F_EVENT_COLLISION))
 		return false;
 
 	if (lf->len > LIN_MAX_DLEN)
@@ -111,16 +120,32 @@ static inline bool lin_is_lin_skb(const struct sk_buff *skb)
 
 	if (lf->flags & LIN_F_EVENT_COLLISION) {
 		/* Event-triggered slot collision notification: not an error
-		 * and carries no payload. lin_id is the trigger ID; len and
-		 * err_mask must be zero, and LIN_F_ERR must be clear.
+		 * and carries no payload or wire checksum. lin_id is the
+		 * trigger ID; len, err_mask, and the LIN_F_ERR / LIN_F_CHK_ENH
+		 * bits must all be clear.
 		 */
-		if (lf->flags & LIN_F_ERR)
+		if (lf->flags & (LIN_F_ERR | LIN_F_CHK_ENH))
 			return false;
 		if (lf->err_mask)
 			return false;
 		if (lf->lin_id & ~LIN_ID_MASK)
 			return false;
 		if (lf->len)
+			return false;
+	} else if (lf->flags & LIN_F_WAKEUP) {
+		/* Wakeup signals carry no data, no error class, and no
+		 * checksum byte on the wire; LIN_F_CHK_ENH is meaningless
+		 * here. Cannot coexist with an error frame in the same skb.
+		 */
+		if (lf->flags & LIN_F_ERR)
+			return false;
+		if (lf->flags & LIN_F_CHK_ENH)
+			return false;
+		if (lf->lin_id != LIN_ID_NONE)
+			return false;
+		if (lf->len)
+			return false;
+		if (lf->err_mask)
 			return false;
 	} else if (lf->flags & LIN_F_ERR) {
 		if (!lf->err_mask)
@@ -136,6 +161,15 @@ static inline bool lin_is_lin_skb(const struct sk_buff *skb)
 		if (lf->lin_id >= LIN_ID_RESERVED_FIRST)
 			return false;
 		if (lf->len < 1)
+			return false;
+		/* Diagnostic IDs use classic checksum per LIN spec; an
+		 * enhanced-checksum data frame on 0x3C / 0x3D is a
+		 * protocol violation. Such frames must be surfaced as
+		 * LIN_F_ERR with LIN_ERR_CHECKSUM, not as data frames.
+		 */
+		if ((lf->lin_id == LIN_ID_DIAG_MASTER_REQ ||
+		     lf->lin_id == LIN_ID_DIAG_SLAVE_RESP) &&
+		    (lf->flags & LIN_F_CHK_ENH))
 			return false;
 	}
 

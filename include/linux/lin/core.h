@@ -147,6 +147,35 @@ void lin_rx_unregister(struct net *net, struct net_device *dev,
 		       void *data);
 
 /**
+ * lin_rx_register_wakeup - subscribe a socket to bus wakeup signals
+ * @net:    target network namespace
+ * @dev:    target netdev, or NULL for ifindex-0 binding
+ * @func:   callback invoked for each wakeup frame
+ * @data:   opaque pointer passed to @func
+ * @ident:  debug identifier
+ * @sk:     owning sock (for accounting + ref bookkeeping)
+ *
+ * Wakeup subscriptions have no filter shape: every wakeup-flagged
+ * frame on the bound interface (or every LIN interface in @net for
+ * ifindex-0) is delivered. Off by default — sockets must call this
+ * helper explicitly to receive wakeup events. Used by LIN_RAW's
+ * LIN_RAW_WAKEUP_FILTER sockopt.
+ */
+int  lin_rx_register_wakeup(struct net *net, struct net_device *dev,
+			    void (*func)(struct sk_buff *skb, void *data),
+			    void *data, const char *ident, struct sock *sk);
+
+/**
+ * lin_rx_unregister_wakeup - remove a wakeup subscription
+ *
+ * Arguments must match the values passed to lin_rx_register_wakeup().
+ * At most one matching entry is removed.
+ */
+void lin_rx_unregister_wakeup(struct net *net, struct net_device *dev,
+			      void (*func)(struct sk_buff *skb, void *data),
+			      void *data);
+
+/**
  * lin_master_claim - claim the master role on a LIN interface
  * @dev: target LIN netdev (must not be NULL)
  * @sk:  socket acquiring the role
@@ -343,5 +372,71 @@ int  lin_schedule_stop(struct net_device *dev, struct sock *sk);
  * when done.
  */
 void lin_schedule_release_all(struct net_device *dev, struct sock *sk);
+
+/**
+ * lin_header_send - fire a single LIN header out-of-schedule
+ * @dev:    target LIN netdev
+ * @sk:     owning socket; must currently hold the master role
+ * @lin_id: 6-bit LIN frame ID
+ * @data:   master-published payload bytes (@len bytes), or NULL/0 for a
+ *          read transaction where the slave is expected to respond
+ * @len:    0 for a read transaction, 1..LIN_MAX_DLEN for a write
+ * @enh:    true for enhanced checksum, false for classic
+ *
+ * The kernel's one-shot header emission primitive. Not exposed to
+ * userspace directly; the core currently invokes it only for the
+ * LIN_RAW_SLEEP command frame, and a future LIN transport-protocol
+ * module would build on it too.
+ *
+ * Caller must hold ld->policy_lock. Validates role, op presence, and
+ * ID range, then synchronously dispatches the emission via the
+ * driver's header_send op, which blocks until the full frame slot
+ * has completed on the wire (header + master data, or header +
+ * slave response window for reads). On successful return the bus
+ * is idle and any response has already been delivered via the
+ * normal rx path; a subsequent LIN_RAW_SCHEDULE_ACTIVATE is
+ * race-free. Bounded by one frame slot duration of the configured
+ * LIN bitrate, typically 5-20 ms.
+ *
+ * Diagnostic IDs (0x3C / 0x3D) require the driver to advertise
+ * LIN_CAP_DIAG, and must use classic checksum per LIN spec —
+ * @enh == true on 0x3C / 0x3D returns -EINVAL.
+ *
+ * Returns -EOPNOTSUPP if the driver does not implement the header_send
+ * op (or if @lin_id is a diagnostic ID and the driver lacks
+ * LIN_CAP_DIAG, or @enh is true and the driver lacks LIN_CAP_CHK_ENH),
+ * -EPERM if @sk is not the current master, -EINVAL on validation
+ * failure (out-of-range @lin_id, reserved ID 0x3E / 0x3F,
+ * @len > LIN_MAX_DLEN, or @enh on a diagnostic ID), -EBUSY if a
+ * schedule is currently active on this interface or if @len > 0 and
+ * the ID has an existing publisher, -errno from the driver (e.g.
+ * -ETIMEDOUT if hardware fails to complete the slot within the
+ * bounded wait).
+ */
+int  lin_header_send(struct net_device *dev, struct sock *sk,
+		     u8 lin_id, const u8 *data, u8 len, bool enh);
+
+/**
+ * lin_wakeup_send - drive a bus wakeup pulse on a LIN interface
+ * @dev: target LIN netdev
+ *
+ * Caller must hold ld->policy_lock. Per LIN 2.1+, any node (master
+ * or slave) may wake the bus by holding it dominant for 250-5000us;
+ * this helper does not check the master claim. It does require the
+ * driver to advertise LIN_CAP_WAKEUP and rejects with -EBUSY if a
+ * schedule is currently active on the interface — wakeup signaling
+ * and active traffic don't mix; the bus should be idle (typically
+ * asleep) when a wakeup is issued.
+ *
+ * Synchronous: blocks until the wakeup pulse has completed on the
+ * wire (~5 ms maximum per spec). On successful return the bus is
+ * recessive and a subsequent LIN_RAW_SCHEDULE_ACTIVATE is race-free
+ * against the pulse.
+ *
+ * Returns -EOPNOTSUPP if the driver does not advertise
+ * LIN_CAP_WAKEUP, -EBUSY if a schedule is active, -errno from the
+ * driver (e.g. -ETIMEDOUT if hardware fails to complete the pulse).
+ */
+int  lin_wakeup_send(struct net_device *dev);
 
 #endif /* !_LIN_CORE_H */

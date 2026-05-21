@@ -119,6 +119,7 @@ void lin_dev_rcv_lists_init(struct lin_dev_rcv_lists *rl)
 	INIT_HLIST_HEAD(&rl->filter);
 	INIT_HLIST_HEAD(&rl->inv);
 	INIT_HLIST_HEAD(&rl->err);
+	INIT_HLIST_HEAD(&rl->wakeup);
 	rl->entries = 0;
 }
 EXPORT_SYMBOL(lin_dev_rcv_lists_init);
@@ -816,6 +817,95 @@ void lin_schedule_release_all(struct net_device *dev, struct sock *sk)
 }
 EXPORT_SYMBOL(lin_schedule_release_all);
 
+int lin_header_send(struct net_device *dev, struct sock *sk,
+		    u8 lin_id, const u8 *data, u8 len, bool enh)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!ld->ops->header_send)
+		return -EOPNOTSUPP;
+	if (rcu_dereference_protected(ld->master_sk, lockdep_is_held(&ld->policy_lock)) != sk)
+		return -EPERM;
+	if (lin_id & ~LIN_ID_MASK)
+		return -EINVAL;
+	if (len > LIN_MAX_DLEN)
+		return -EINVAL;
+	/* Reserved IDs (0x3E/0x3F) are never legal on the wire. Diagnostic
+	 * IDs (0x3C/0x3D) use classic checksum per LIN spec; enhanced
+	 * checksum on them is a protocol violation regardless of driver
+	 * capability.
+	 *
+	 * Note we do NOT require LIN_CAP_DIAG to emit a one-shot header on a
+	 * diagnostic ID. Putting a single header on 0x3C/0x3D (e.g. the
+	 * go-to-sleep command) is a base master operation any master driver
+	 * can do; LIN_CAP_DIAG gates diagnostic *transport* — schedule
+	 * TYPE_DIAG routing and slave-side responders — not raw emission.
+	 * This keeps LIN_RAW_SLEEP available to any master, matching its
+	 * documented contract (master + header_send + no active schedule).
+	 */
+	if (lin_id == LIN_ID_DIAG_MASTER_REQ ||
+	    lin_id == LIN_ID_DIAG_SLAVE_RESP) {
+		if (enh)
+			return -EINVAL;
+	} else if (lin_id >= LIN_ID_RESERVED_FIRST) {
+		return -EINVAL;
+	}
+
+	if (enh && !(ld->caps & LIN_CAP_CHK_ENH))
+		return -EOPNOTSUPP;
+
+	/* One-shot emission while a schedule is running would force the
+	 * driver to choose between colliding with a scheduled slot,
+	 * pre-empting one, or queuing — each with different timing
+	 * surprises. Disallow it: the active schedule must be stopped
+	 * first. This keeps the emission's effect on the bus
+	 * deterministic and removes the driver-defined behavior from the
+	 * contract.
+	 */
+	if (ld->active_schedule >= 0)
+		return -EBUSY;
+
+	/* Write transaction (master publishes data) collides with any
+	 * existing publisher on the same ID — the wire would carry two
+	 * different responses for one header. Read transactions are fine
+	 * because the slave's response is the only data on the slot.
+	 */
+	if (len > 0 && rcu_dereference_protected(ld->publishers[lin_id],
+						 lockdep_is_held(&ld->policy_lock)))
+		return -EBUSY;
+
+	return ld->ops->header_send(ld, lin_id, data, len, enh);
+}
+EXPORT_SYMBOL(lin_header_send);
+
+int lin_wakeup_send(struct net_device *dev)
+{
+	struct lin_dev *ld = lin_get_ml_priv(dev);
+
+	might_sleep();
+
+	lockdep_assert_held(&ld->policy_lock);
+
+	if (!(ld->caps & LIN_CAP_WAKEUP) || !ld->ops->wakeup_send)
+		return -EOPNOTSUPP;
+
+	/* Wakeup is meaningful when the bus is quiescent (typically
+	 * asleep). An active schedule means the bus is awake and
+	 * carrying traffic; a wakeup pulse mid-slot would corrupt
+	 * frame timing. Disallow it: callers must stop the schedule
+	 * first if one is running.
+	 */
+	if (ld->active_schedule >= 0)
+		return -EBUSY;
+
+	return ld->ops->wakeup_send(ld);
+}
+EXPORT_SYMBOL(lin_wakeup_send);
+
 int lin_register_netdev(struct net_device *dev)
 {
 	struct lin_dev *ld = lin_get_ml_priv(dev);
@@ -865,6 +955,13 @@ int lin_register_netdev(struct net_device *dev)
 	 * at registration time.
 	 */
 	if (master_ops == 0 && ld->ops->header_send)
+		return -EINVAL;
+
+	/* @wakeup_send is optional and gated by LIN_CAP_WAKEUP. The cap
+	 * and the op must agree. No master-ops dependency — any node
+	 * may wake the bus.
+	 */
+	if (!!(ld->caps & LIN_CAP_WAKEUP) != !!ld->ops->wakeup_send)
 		return -EINVAL;
 
 	/* Mark the interface as carrier-off until the driver opens it and

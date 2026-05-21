@@ -69,13 +69,13 @@
  * down, the role-agnostic operations LIN_RAW_MASTER, LIN_RAW_PUBLISH,
  * LIN_RAW_UNPUBLISH, LIN_RAW_WAKEUP, and sendmsg() / write() (which
  * upserts a publisher entry) return -ENETDOWN. The master-gated
- * operations LIN_RAW_SCHEDULE_{LOAD,DELETE,ACTIVATE,STOP},
- * LIN_RAW_SEND_HEADER, and LIN_RAW_SLEEP instead return -EPERM while
- * down: the master-role check precedes the link-state check, and no
- * socket can hold the role across a down transition — the going-down
- * drain (below) force-releases the claim and LIN_RAW_MASTER itself
- * returns -ENETDOWN while down, so the role cannot be re-acquired
- * until the interface is back up. Subscription / state-only sockopts —
+ * operations LIN_RAW_SCHEDULE_{LOAD,DELETE,ACTIVATE,STOP} and
+ * LIN_RAW_SLEEP instead return -EPERM while down: the master-role
+ * check precedes the link-state check, and no socket can hold the
+ * role across a down transition — the going-down drain (below)
+ * force-releases the claim and LIN_RAW_MASTER itself returns
+ * -ENETDOWN while down, so the role cannot be re-acquired until the
+ * interface is back up. Subscription / state-only sockopts —
  * LIN_RAW_FILTER, LIN_RAW_ERR_FILTER, LIN_RAW_LOOPBACK,
  * LIN_RAW_RECV_OWN_MSGS, LIN_RAW_JOIN_FILTERS, LIN_RAW_WAKEUP_FILTER —
  * remain available regardless of link state.
@@ -137,6 +137,11 @@ enum {
 	LIN_RAW_SCHEDULE_DELETE,	/* remove a schedule by handle         */
 	LIN_RAW_SCHEDULE_ACTIVATE,	/* switch active schedule              */
 	LIN_RAW_SCHEDULE_STOP,		/* stop the active schedule            */
+
+	/* Bus state transitions: */
+	LIN_RAW_WAKEUP,			/* drive a bus wakeup pulse            */
+	LIN_RAW_WAKEUP_FILTER,		/* subscribe to wakeup events (bool)   */
+	LIN_RAW_SLEEP,			/* send the LIN sleep command frame    */
 };
 
 /*
@@ -492,6 +497,53 @@ struct lin_schedule {
 	__u8	__res[8];
 	struct lin_schedule_entry entry[];
 };
+
+/*
+ * Bus state transitions: wakeup and sleep
+ *
+ * LIN 2.1+ defines two distinct bus-level state changes:
+ *
+ *   LIN_RAW_WAKEUP — drive a wakeup pulse:
+ *
+ *     setsockopt(sock, SOL_LIN_RAW, LIN_RAW_WAKEUP, NULL, 0);
+ *
+ *   The driver pulls the bus dominant for 250-5000us. Per spec, any
+ *   node may wake the bus — no master-role gate. Requires the driver
+ *   to advertise LIN_CAP_WAKEUP and the bus to be quiescent (no active
+ *   schedule). Returns -EOPNOTSUPP without the cap, -EBUSY if a
+ *   schedule is currently active.
+ *
+ *   Synchronous: blocks until the wakeup pulse has completed on the
+ *   wire (~5 ms maximum). On successful return the bus is recessive
+ *   and a subsequent schedule activation or ad-hoc header emission
+ *   is race-free against the pulse.
+ *
+ *   LIN_RAW_WAKEUP_FILTER — subscribe to wakeup events:
+ *
+ *     int on = 1;
+ *     setsockopt(sock, SOL_LIN_RAW, LIN_RAW_WAKEUP_FILTER,
+ *                &on, sizeof(int));
+ *
+ *   Off by default. Enables delivery of wakeup-flagged frames
+ *   (LIN_F_WAKEUP set, lin_id == LIN_ID_NONE, len == 0) to this
+ *   socket. Wakeup frames are routed to a disjoint subscriber list
+ *   from data and error frames; they never reach the default match-
+ *   all filter or any LIN_RAW_FILTER entry.
+ *
+ *   LIN_RAW_SLEEP — send the LIN sleep command frame:
+ *
+ *     setsockopt(sock, SOL_LIN_RAW, LIN_RAW_SLEEP, NULL, 0);
+ *
+ *   Emits the spec-defined sleep command — a master frame on lin_id
+ *   0x3C with payload {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+ *   and classic checksum. Requires the socket hold LIN_RAW_MASTER on
+ *   the bound interface, the driver implement the one-shot header
+ *   emission primitive, and no schedule be active; blocks until the
+ *   sleep frame has been fully emitted on the wire. Returns -EOPNOTSUPP
+ *   if the driver does not support header emission, -EBUSY if a
+ *   schedule is active. Sleep is master-initiated — there's no
+ *   slave-side analogue per spec.
+ */
 
 /*
  * Activate a loaded schedule (LIN_RAW_SCHEDULE_ACTIVATE)

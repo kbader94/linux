@@ -88,6 +88,21 @@
 #define LIN_F_CHK_ENH	0x02	/* enhanced checksum was used on the wire
 				 * (as opposed to the classic checksum).
 				 */
+#define LIN_F_EVENT_COLLISION	0x08	/* event-triggered slot collision: the
+					 * master polled an event-triggered
+					 * frame and two or more slaves
+					 * answered. A non-error notification
+					 * (mutually exclusive with LIN_F_ERR)
+					 * carrying no data — lin_id is the
+					 * event-trigger ID, len is 0, err_mask
+					 * is 0. The master resolves it by
+					 * running the slot's collision-resolving
+					 * schedule. Delivered through the normal
+					 * filter path, so subscribe by matching
+					 * the trigger ID (or match-all).
+					 * (0x04 is LIN_F_WAKEUP, added with bus
+					 * wakeup support.)
+					 */
 
 /**
  * struct lin_frame - LIN frame exchanged over PF_LIN sockets

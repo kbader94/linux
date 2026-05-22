@@ -330,8 +330,11 @@ struct lin_publish {
  *     to advertise LIN_CAP_SPORADIC. Every member ID must already
  *     have a publisher registered on the interface (load-time
  *     validation: -EINVAL otherwise).
- *   - TYPE_EVENT is reserved (v2). Returns -EOPNOTSUPP regardless of
- *     driver capability.
+ *   - TYPE_EVENT requires the driver to advertise LIN_CAP_EVENT,
+ *     member_count == 1 (members[0] = trigger ID), and a @cr_handle
+ *     naming an already-loaded collision-resolving schedule (other
+ *     than this one) that contains only TYPE_UNCOND entries. Load the
+ *     collision-resolving schedule first.
  */
 #define LIN_SCHED_TYPE_UNCOND	0x00	/* single unconditional frame */
 #define LIN_SCHED_TYPE_SPORADIC	0x01	/* emit one of @members whose
@@ -341,11 +344,16 @@ struct lin_publish {
 					 * case; >1 expresses LIN's grouped
 					 * sporadic semantics.
 					 */
-#define LIN_SCHED_TYPE_EVENT	0x02	/* event-triggered (reserved; v1
-					 * returns -EOPNOTSUPP). Will use
-					 * @members[0] as the trigger ID
-					 * and @members[1..] as the
-					 * fallback unconditional members.
+#define LIN_SCHED_TYPE_EVENT	0x02	/* event-triggered frame: master
+					 * polls a group with one trigger
+					 * header (@members[0]); a slave answers
+					 * only if its frame has fresh data —
+					 * usually at most one, but two or more
+					 * may answer at once and collide. On a
+					 * collision the driver switches to the
+					 * schedule named by @cr_handle, runs it
+					 * once, then resumes. Requires
+					 * LIN_CAP_EVENT.
 					 */
 #define LIN_SCHED_TYPE_DIAG	0x03	/* diagnostic frame slot (0x3C/0x3D) */
 
@@ -360,15 +368,15 @@ struct lin_publish {
  * @type:         LIN_SCHED_TYPE_* (one of the values above)
  * @flags:        reserved, must be zero
  * @member_count: number of valid IDs in @members (1..LIN_SLOT_MAX_MEMBERS)
- * @cr_handle:    reserved for a future TYPE_EVENT collision-resolving
- *                schedule handle (this commit defines only the byte;
- *                TYPE_EVENT itself is rejected as -EOPNOTSUPP at the
- *                schedule-API commit). The byte is compiler-mandated
- *                alignment padding for @slot_us made explicit and
- *                validated as zero for every non-TYPE_EVENT entry so
- *                it stays repurposable; TYPE_EVENT entries will name
- *                their collision-resolving table here when that type
- *                is enabled.
+ * @cr_handle:    TYPE_EVENT only: handle of the collision-resolving
+ *                schedule table to switch to when a collision is
+ *                detected on this event-triggered slot. Must reference
+ *                an already-loaded schedule (load it first), must not
+ *                be this schedule's own handle, and that schedule must
+ *                contain only TYPE_UNCOND entries (each group member is
+ *                polled in its own unconditional slot). Must be zero for
+ *                all other frame types. (Repurposes what was alignment
+ *                padding before @slot_us.)
  * @slot_us:      frame slot duration in microseconds; 0 = inherit
  *                struct lin_schedule.default_slot_us
  * @members:      6-bit frame IDs participating in this slot.
@@ -384,10 +392,16 @@ struct lin_publish {
  *                                 order (lowest @members index
  *                                 wins). Slot stays silent when no
  *                                 member is dirty.
- *                  TYPE_EVENT:    @members[0] is the event-triggered
- *                                 trigger ID; @members[1..] are the
- *                                 unconditional fallback members
- *                                 (reserved for v2).
+ *                  TYPE_EVENT:    @member_count == 1; @members[0] is the
+ *                                 event-triggered frame's own ID (the
+ *                                 trigger the master polls). The
+ *                                 associated unconditional frames are
+ *                                 not listed here — they live in the
+ *                                 collision-resolving schedule named by
+ *                                 @cr_handle, and responders self-
+ *                                 identify via the first response data
+ *                                 byte (the protected ID of the
+ *                                 answering unconditional frame).
  * @__res:        trailing reserved bytes, must be all zero on write.
  *                Sized to absorb one future u64-scale per-entry field
  *                (e.g. per-entry priority, retry count, slot variant)
@@ -452,12 +466,23 @@ struct lin_schedule_entry {
  *   - Structural: handle / entry_count / member_count ranges,
  *     reserved fields zero, type-specific member shape.
  *   - Capability: TYPE_SPORADIC requires LIN_CAP_SPORADIC, TYPE_DIAG
- *     requires LIN_CAP_DIAG; missing capability returns -EOPNOTSUPP.
- *     TYPE_EVENT is reserved for v2 and always returns -EOPNOTSUPP.
+ *     requires LIN_CAP_DIAG, TYPE_EVENT requires LIN_CAP_EVENT;
+ *     missing capability returns -EOPNOTSUPP.
  *   - Publisher existence: every TYPE_SPORADIC member must have a
  *     publisher registered on the interface (LIN_RAW_PUBLISH). Missing
  *     publisher returns -EINVAL. Per-cluster setup order: register
  *     publishers first, then load schedules.
+ *   - Event collision-resolving reference: every TYPE_EVENT entry's
+ *     @cr_handle must name a schedule that is already loaded, is not
+ *     this schedule's own handle, and contains only TYPE_UNCOND
+ *     entries; otherwise -EINVAL. Per-cluster setup order: load the
+ *     collision-resolving schedule first, then the schedule containing
+ *     the event-triggered slot. A loaded collision-resolving schedule is
+ *     pinned while any loaded schedule references it: it can be neither
+ *     deleted nor replaced (LIN_RAW_SCHEDULE_DELETE, and a LOAD over its
+ *     handle, both return -EBUSY), so its unconditional-only property
+ *     cannot change behind a referrer. Delete the referencing schedule
+ *     first.
  */
 struct lin_schedule {
 	__u8	handle;
@@ -518,8 +543,10 @@ struct lin_schedule {
  *   setsockopt(sock, SOL_LIN_RAW, LIN_RAW_SCHEDULE_DELETE,
  *              &handle, sizeof(int));
  *
- * Returns -EBUSY if @handle is the currently-active schedule; stop it
- * first.
+ * Returns -EBUSY if @handle is the currently-active schedule (stop it
+ * first), or if @handle is referenced as the collision-resolving
+ * schedule (@cr_handle) of a TYPE_EVENT slot in another loaded
+ * schedule (delete the referencing schedule first).
  */
 
 #endif /* !_UAPI_LIN_RAW_H */

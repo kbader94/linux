@@ -103,13 +103,26 @@ static inline bool lin_is_lin_skb(const struct sk_buff *skb)
 	if (memchr_inv(lf->__res, 0, sizeof(lf->__res)))
 		return false;
 
-	if (lf->flags & ~(LIN_F_ERR | LIN_F_CHK_ENH))
+	if (lf->flags & ~(LIN_F_ERR | LIN_F_CHK_ENH | LIN_F_EVENT_COLLISION))
 		return false;
 
 	if (lf->len > LIN_MAX_DLEN)
 		return false;
 
-	if (lf->flags & LIN_F_ERR) {
+	if (lf->flags & LIN_F_EVENT_COLLISION) {
+		/* Event-triggered slot collision notification: not an error
+		 * and carries no payload. lin_id is the trigger ID; len and
+		 * err_mask must be zero, and LIN_F_ERR must be clear.
+		 */
+		if (lf->flags & LIN_F_ERR)
+			return false;
+		if (lf->err_mask)
+			return false;
+		if (lf->lin_id & ~LIN_ID_MASK)
+			return false;
+		if (lf->len)
+			return false;
+	} else if (lf->flags & LIN_F_ERR) {
 		if (!lf->err_mask)
 			return false;
 		if (lf->lin_id != LIN_ID_NONE &&

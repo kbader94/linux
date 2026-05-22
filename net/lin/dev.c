@@ -71,6 +71,8 @@ void lin_dev_init(struct net_device *dev, const struct lin_dev_ops *ops,
 	memset(ld->publishers, 0, sizeof(ld->publishers));
 	ld->active_schedule = -1;
 	bitmap_zero(ld->schedules_loaded, LIN_RAW_SCHEDULES_MAX);
+	bitmap_zero(ld->sched_uncond_only, LIN_RAW_SCHEDULES_MAX);
+	memset(ld->sched_cr_refs, 0, sizeof(ld->sched_cr_refs));
 	ld->going_down = false;
 
 	lin_set_ml_priv(dev, ld);
@@ -382,10 +384,14 @@ static int lin_schedule_validate_entry(const struct lin_dev *ld,
 	unsigned int i;
 	bool seen_diag;
 
-	/* @cr_handle is reserved for TYPE_EVENT (introduced in a later
-	 * commit); for every type validated here it must be zero.
+	if (e->flags)
+		return -EINVAL;
+	/* @cr_handle carries the collision-resolving schedule handle for
+	 * TYPE_EVENT only; every other type must leave it zero. The
+	 * TYPE_EVENT case below range-checks it, and
+	 * lin_schedule_validate() checks it is loaded and not self.
 	 */
-	if (e->flags || e->cr_handle)
+	if (e->type != LIN_SCHED_TYPE_EVENT && e->cr_handle)
 		return -EINVAL;
 	if (memchr_inv(e->__res, 0, sizeof(e->__res)))
 		return -EINVAL;
@@ -442,7 +448,25 @@ static int lin_schedule_validate_entry(const struct lin_dev *ld,
 		 */
 		break;
 	case LIN_SCHED_TYPE_EVENT:
-		return -EOPNOTSUPP;
+		if (!(ld->caps & LIN_CAP_EVENT))
+			return -EOPNOTSUPP;
+		/* members[0] is the event-trigger ID (already range- and
+		 * non-reserved-checked above); it must not be a diagnostic
+		 * ID, and the slot carries only the trigger. The associated
+		 * unconditional frames live in the collision-resolving
+		 * schedule named by @cr_handle, not here.
+		 */
+		if (seen_diag)
+			return -EINVAL;
+		if (e->member_count != 1)
+			return -EINVAL;
+		if (e->cr_handle >= LIN_RAW_SCHEDULES_MAX)
+			return -EINVAL;
+		/* @cr_handle "already loaded" and "not this schedule's own
+		 * handle" are checked in lin_schedule_validate(), which has
+		 * sched->handle and the schedules_loaded bitmap.
+		 */
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -520,14 +544,64 @@ static int lin_schedule_validate(const struct lin_dev *ld,
 		}
 	}
 
+	/* Event collision-resolving references. Each TYPE_EVENT slot names
+	 * a collision-resolving schedule via @cr_handle; it must already be
+	 * loaded and must not be this schedule itself. Load the
+	 * collision-resolving schedule before the schedule that references
+	 * it. (Range was checked per-entry above.)
+	 */
+	for (i = 0; i < sched->entry_count; i++) {
+		const struct lin_schedule_entry *e = &sched->entry[i];
+
+		if (e->type != LIN_SCHED_TYPE_EVENT)
+			continue;
+		if (e->cr_handle == sched->handle)
+			return -EINVAL;
+		if (!test_bit(e->cr_handle, ld->schedules_loaded))
+			return -EINVAL;
+		/* A collision diverts the running schedule into the
+		 * collision-resolving schedule, which must poll each group
+		 * member in its own unconditional slot; reject a cr_handle whose
+		 * schedule carries any non-TYPE_UNCOND entry. This also makes a
+		 * nested event slot in a collision-resolving schedule
+		 * impossible (an event entry is not unconditional).
+		 */
+		if (!test_bit(e->cr_handle, ld->sched_uncond_only))
+			return -EINVAL;
+	}
+
 	return 0;
+}
+
+/* True if any loaded schedule names @handle as its TYPE_EVENT
+ * collision-resolving table. Such a handle is pinned against both delete
+ * and reload, so the unconditional-only property checked at the referrer's
+ * load stays true for as long as the referrer is loaded.
+ */
+static bool lin_handle_is_cr_referenced(const struct lin_dev *ld, u8 handle)
+{
+	unsigned int i;
+
+	for (i = 0; i < LIN_RAW_SCHEDULES_MAX; i++)
+		if (test_bit(i, ld->schedules_loaded) &&
+		    (ld->sched_cr_refs[i] & BIT(handle)))
+			return true;
+	return false;
 }
 
 int lin_schedule_load(struct net_device *dev, struct sock *sk,
 		      const struct lin_schedule *sched, size_t buf_size)
 {
 	struct lin_dev *ld = lin_get_ml_priv(dev);
+	unsigned long cr_refs = 0;
+	bool uncond_only = true;
+	unsigned int i;
 	int err;
+
+	/* sched_cr_refs[] packs the per-schedule referenced-handle set into
+	 * one unsigned long per schedule, so the handle space must fit.
+	 */
+	BUILD_BUG_ON(LIN_RAW_SCHEDULES_MAX > BITS_PER_LONG);
 
 	might_sleep();
 
@@ -553,9 +627,46 @@ int lin_schedule_load(struct net_device *dev, struct sock *sk,
 	    sched->handle == (u8)ld->active_schedule)
 		return -EBUSY;
 
+	/* Refuse to replace a schedule that any loaded schedule references as
+	 * a TYPE_EVENT collision-resolving table. Two hazards: an active
+	 * referrer could divert the running engine into the table mid-replace
+	 * (the live-execution hazard, as with replacing the active handle
+	 * itself); and a replacement could turn the table non-unconditional,
+	 * breaking the unconditional-only guarantee that lin_schedule_validate
+	 * checked at the referrer's load and that activation never rechecks.
+	 * Pinning it here (symmetric with schedule_delete) keeps that
+	 * guarantee true for the life of the reference; drop the referrer
+	 * first to edit the table.
+	 */
+	if (lin_handle_is_cr_referenced(ld, sched->handle))
+		return -EBUSY;
+
 	err = ld->ops->schedule_load(ld, sched);
 	if (err)
 		return err;
+
+	/* Record which collision-resolving schedules this one references,
+	 * so SCHEDULE_DELETE can refuse to delete a still-referenced
+	 * handle. Recomputed on every (re)load, replacing the prior set.
+	 * Validation already confirmed each cr_handle is loaded and != self.
+	 */
+	for (i = 0; i < sched->entry_count; i++) {
+		const struct lin_schedule_entry *e = &sched->entry[i];
+
+		if (e->type == LIN_SCHED_TYPE_EVENT)
+			cr_refs |= BIT(e->cr_handle);
+		if (e->type != LIN_SCHED_TYPE_UNCOND)
+			uncond_only = false;
+	}
+	ld->sched_cr_refs[sched->handle] = cr_refs;
+
+	/* Record eligibility as a collision-resolving table. Recomputed on
+	 * every (re)load so a replacing schedule's type mix takes effect.
+	 */
+	if (uncond_only)
+		set_bit(sched->handle, ld->sched_uncond_only);
+	else
+		clear_bit(sched->handle, ld->sched_uncond_only);
 
 	set_bit(sched->handle, ld->schedules_loaded);
 	return 0;
@@ -583,10 +694,19 @@ int lin_schedule_delete(struct net_device *dev, struct sock *sk,
 	if (ld->active_schedule == handle)
 		return -EBUSY;
 
+	/* Refuse deletion while another loaded schedule still names this
+	 * handle as its TYPE_EVENT collision-resolving schedule — that
+	 * reference would dangle. Delete the referencing schedule first.
+	 */
+	if (lin_handle_is_cr_referenced(ld, handle))
+		return -EBUSY;
+
 	err = ld->ops->schedule_delete(ld, handle);
 	if (err)
 		return err;
 
+	ld->sched_cr_refs[handle] = 0;
+	clear_bit(handle, ld->sched_uncond_only);
 	clear_bit(handle, ld->schedules_loaded);
 	return 0;
 }
@@ -691,6 +811,8 @@ void lin_schedule_release_all(struct net_device *dev, struct sock *sk)
 				   handle, err);
 	}
 	bitmap_zero(ld->schedules_loaded, LIN_RAW_SCHEDULES_MAX);
+	bitmap_zero(ld->sched_uncond_only, LIN_RAW_SCHEDULES_MAX);
+	memset(ld->sched_cr_refs, 0, sizeof(ld->sched_cr_refs));
 }
 EXPORT_SYMBOL(lin_schedule_release_all);
 

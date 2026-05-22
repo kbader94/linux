@@ -39,8 +39,12 @@
 					 * lin_schedule_entry.members[].
 					 */
 #define LIN_CAP_EVENT		0x02	/* TYPE_EVENT schedule slots
-					 * (reserved for v2; v1 always
-					 * rejects regardless of caps)
+					 * (driver emits the event-trigger
+					 * header, demuxes the responder via
+					 * the first response data byte, and
+					 * auto-switches to the slot's
+					 * collision-resolving schedule on a
+					 * collision)
 					 */
 #define LIN_CAP_DIAG		0x04	/* diagnostic ID handling. Master-
 					 * side: TYPE_DIAG schedule slots

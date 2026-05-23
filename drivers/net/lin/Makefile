@@ -4,3 +4,5 @@
 #
 
 obj-y			+= dev/
+
+obj-$(CONFIG_LIN_VLIN)	+= vlin.o

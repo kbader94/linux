@@ -50,6 +50,7 @@ obj-$(CONFIG_MHI_NET) += mhi_net.o
 obj-$(CONFIG_ARCNET) += arcnet/
 obj-$(CONFIG_CAIF) += caif/
 obj-$(CONFIG_CAN) += can/
+obj-$(CONFIG_LIN) += lin/
 ifdef CONFIG_NET_DSA
 obj-y += dsa/
 endif

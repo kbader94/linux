@@ -12,3 +12,26 @@ config LIN_DEV_HELPERS
 	  synthesiser. Auto-selected by every in-tree LIN driver that
 	  drives the bus from the host; users do not set this directly.
 	  Modelled on can-dev.
+
+config LIN_VLIN
+	tristate "Virtual Local Interconnect Network interface (vlin)"
+	depends on LIN
+	select LIN_DEV_HELPERS
+	help
+	  Software-only LIN interface, the LIN analogue of vcan. It has no
+	  hardware: the interface is its own bus. A master socket's schedule
+	  drives headers, registered publishers supply responses, and every
+	  resulting frame is looped back to the sockets bound to the
+	  interface. Master schedule execution (unconditional, sporadic, and
+	  event-triggered slots, including collision resolution), bus wakeup,
+	  and the sleep command are all simulated in software.
+
+	  Create an instance with:
+
+	    ip link add dev vlin0 type vlin
+
+	  This is useful for developing and testing PF_LIN applications and
+	  the LIN core without LIN hardware.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called vlin.

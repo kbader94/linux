@@ -76,6 +76,17 @@ struct vlin_priv {
 	u8			activate_to;
 	struct completion	activate_done;
 
+	/* Event-collision diversion. While @diverted the engine is running
+	 * a collision-resolving schedule for one cycle, after which it
+	 * resumes @saved_handle at @saved_slot. @divert_pending tells the
+	 * per-slot advance that the event handler already repositioned
+	 * @active / @slot, so it must not advance this time.
+	 */
+	bool			diverted;
+	bool			divert_pending;
+	int			saved_handle;
+	unsigned int		saved_slot;
+
 	struct delayed_work	engine;
 };
 
@@ -142,6 +153,25 @@ static void vlin_emit_response(struct net_device *dev, u8 header_id, u8 resp_id,
 	lin_loopback_rx(dev, &f, LIN_EMIT_MASTER | LIN_EMIT_PUBLISHER, resp_id);
 }
 
+/* Event-triggered slot collision: two or more group members had fresh
+ * data. Deliver the non-error LIN_F_EVENT_COLLISION notification on the
+ * trigger ID. Like NO_RESPONSE / wakeup it is a bus-observed event, so
+ * it goes through the plain rx path with no owner tags.
+ */
+static void vlin_emit_collision(struct net_device *dev, u8 trigger)
+{
+	struct lin_frame f = {
+		.lin_id = trigger,
+		.flags  = LIN_F_EVENT_COLLISION,
+		.len    = 0,
+	};
+	struct sk_buff *skb = alloc_lin_skb(dev, &f);
+
+	vlin_count_frame(dev, 0);
+	if (skb)
+		netif_rx(skb);
+}
+
 /* --- schedule engine --- */
 
 /* Duration of @e in jiffies (at least one tick). */
@@ -200,6 +230,87 @@ static void vlin_run_sporadic(struct vlin_priv *vp,
 	}
 }
 
+/* Run one event-triggered slot. The trigger is members[0]; the group is
+ * the unconditional frames listed in the slot's collision-resolving
+ * schedule (@cr_handle). A group member "answers" if its response is
+ * dirty (updated since last emit):
+ *
+ *   0 dirty   no slave has fresh data; the slot stays silent.
+ *   1 dirty   that member answers, carried under the trigger ID. (Its
+ *             own protected ID in the first response byte is a cluster
+ *             convention the publisher fills in; vlin emits the bytes
+ *             as-is.) The response is owner-tagged by the answering
+ *             frame's ID — passed to lin_loopback_rx() as resp_id, not
+ *             the trigger ID, which has no publisher — so RECV_OWN_MSGS
+ *             and the loopback gate work for the answering publisher.
+ *   >1 dirty  collision: notify with LIN_F_EVENT_COLLISION, then divert
+ *             the engine to run the collision-resolving schedule once
+ *             (each member answers in its own unconditional slot) before
+ *             resuming the interrupted schedule.
+ */
+static void vlin_run_event(struct vlin_priv *vp,
+			   const struct lin_schedule_entry *e)
+{
+	u8 trigger = e->members[0] & LIN_ID_MASK;
+	const struct lin_schedule *cr = vp->sched[e->cr_handle];
+	unsigned int i, dirty = 0;
+	u8 first = 0;
+
+	lockdep_assert_held(&vp->lock);
+
+	/* The CR schedule is loaded (validated at load; the active schedule
+	 * pins it against delete/replace). Guard defensively anyway.
+	 */
+	if (!cr)
+		return;
+
+	for (i = 0; i < cr->entry_count; i++) {
+		const struct lin_schedule_entry *ce = &cr->entry[i];
+		u8 id;
+
+		/* The core guarantees a CR schedule is unconditional-only, so
+		 * every entry counts here and the engine runs the very same
+		 * entries when it diverts — detection and execution cannot
+		 * disagree. The skip is belt-and-suspenders.
+		 */
+		if (ce->type != LIN_SCHED_TYPE_UNCOND)
+			continue;
+		id = ce->members[0] & LIN_ID_MASK;
+		if (vp->resp[id].present && vp->resp[id].dirty) {
+			if (!dirty)
+				first = id;
+			dirty++;
+		}
+	}
+
+	if (dirty == 0)
+		return;
+
+	if (dirty == 1) {
+		vp->resp[first].dirty = false;
+		vlin_emit_response(vp->dev, trigger, first, &vp->resp[first]);
+		return;
+	}
+
+	vlin_emit_collision(vp->dev, trigger);
+
+	/* Defence in depth against nested diversions. The core only loads an
+	 * event slot whose collision-resolving schedule is unconditional-only
+	 * (lin_schedule_validate), so a CR schedule cannot itself contain an
+	 * event slot and this branch is unreachable in practice. Were it ever
+	 * entered, deliver the notification but keep the outer resume point.
+	 */
+	if (vp->diverted)
+		return;
+
+	vp->saved_handle = vp->active;
+	vp->saved_slot = vp->slot + 1;		/* resume after this slot */
+	vp->active = e->cr_handle;
+	vp->slot = 0;
+	vp->diverted = true;
+	vp->divert_pending = true;
+}
+
 static void vlin_engine_work(struct work_struct *w)
 {
 	struct vlin_priv *vp = container_of(to_delayed_work(w),
@@ -219,6 +330,11 @@ static void vlin_engine_work(struct work_struct *w)
 		vp->active = vp->activate_to;
 		vp->slot = 0;
 		vp->activate_req = false;
+		/* Abandon any in-progress collision diversion: the new schedule
+		 * starts clean, so there is no interrupted schedule to resume.
+		 */
+		vp->diverted = false;
+		vp->divert_pending = false;
 		complete(&vp->activate_done);
 	}
 
@@ -240,17 +356,40 @@ static void vlin_engine_work(struct work_struct *w)
 	case LIN_SCHED_TYPE_SPORADIC:
 		vlin_run_sporadic(vp, e);
 		break;
+	case LIN_SCHED_TYPE_EVENT:
+		vlin_run_event(vp, e);
+		break;
 	default:
-		/* TYPE_EVENT is not advertised in caps yet, so the core
-		 * rejects it at load; the next commit adds its handling here.
-		 */
 		break;
 	}
 
-	/* Re-arm for the next slot after this slot's duration. */
+	/* Re-arm for the next slot after this slot's duration. The delay is
+	 * measured from the slot just fired (s/e), before the diversion
+	 * repositioning below.
+	 */
 	delay = vlin_slot_delay(s, e);
-	if (++vp->slot >= s->entry_count)
-		vp->slot = 0;
+
+	if (vp->divert_pending) {
+		/* The event handler already repositioned active/slot to the
+		 * collision-resolving schedule's first slot; don't advance.
+		 */
+		vp->divert_pending = false;
+	} else if (++vp->slot >= s->entry_count) {
+		if (vp->diverted) {
+			/* The collision-resolving schedule finished its single
+			 * cycle; resume the interrupted schedule.
+			 */
+			vp->active = vp->saved_handle;
+			vp->slot = vp->saved_slot;
+			if (vp->sched[vp->active] &&
+			    vp->slot >= vp->sched[vp->active]->entry_count)
+				vp->slot = 0;
+			vp->diverted = false;
+		} else {
+			vp->slot = 0;
+		}
+	}
+
 	if (vp->running)
 		schedule_delayed_work(&vp->engine, delay);
 
@@ -268,6 +407,8 @@ static void vlin_engine_halt(struct vlin_priv *vp)
 	vp->running = false;
 	vp->active = -1;
 	vp->activate_req = false;
+	vp->diverted = false;
+	vp->divert_pending = false;
 	spin_unlock(&vp->lock);
 
 	cancel_delayed_work_sync(&vp->engine);
@@ -563,7 +704,7 @@ static void vlin_setup(struct net_device *dev)
 	lin_dev_init(dev, &vlin_lin_ops, sizeof(struct vlin_priv));
 	ld = lin_get_ml_priv(dev);
 	ld->caps = LIN_CAP_DIAG | LIN_CAP_CHK_ENH | LIN_CAP_WAKEUP |
-		   LIN_CAP_SPORADIC;
+		   LIN_CAP_SPORADIC | LIN_CAP_EVENT | LIN_CAP_PUB_SLAVE;
 
 	vp = netdev_priv(dev);
 	vp->dev = dev;

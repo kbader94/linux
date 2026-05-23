@@ -23,6 +23,7 @@ Contents:
    iso15765-2
    j1939
    kapi
+   lin
    msg_zerocopy
    failover
    net_dim

@@ -176,6 +176,30 @@ static void vlin_run_uncond(struct vlin_priv *vp,
 	}
 }
 
+/* Run one sporadic slot: emit the highest-priority (lowest @members
+ * index) member whose response is dirty, clearing its dirty flag; the
+ * slot stays silent when no member has fresh data. The members[] order
+ * is the userspace-to-driver priority contract (index 0 highest).
+ */
+static void vlin_run_sporadic(struct vlin_priv *vp,
+			      const struct lin_schedule_entry *e)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&vp->lock);
+
+	for (i = 0; i < e->member_count; i++) {
+		u8 id = e->members[i] & LIN_ID_MASK;
+		struct vlin_response *r = &vp->resp[id];
+
+		if (r->present && r->dirty) {
+			r->dirty = false;
+			vlin_emit_response(vp->dev, id, id, r);
+			return;
+		}
+	}
+}
+
 static void vlin_engine_work(struct work_struct *w)
 {
 	struct vlin_priv *vp = container_of(to_delayed_work(w),
@@ -213,10 +237,12 @@ static void vlin_engine_work(struct work_struct *w)
 	case LIN_SCHED_TYPE_DIAG:
 		vlin_run_uncond(vp, e);
 		break;
+	case LIN_SCHED_TYPE_SPORADIC:
+		vlin_run_sporadic(vp, e);
+		break;
 	default:
-		/* TYPE_SPORADIC / TYPE_EVENT are not advertised in caps yet,
-		 * so the core rejects them at load; later commits add their
-		 * handling here.
+		/* TYPE_EVENT is not advertised in caps yet, so the core
+		 * rejects it at load; the next commit adds its handling here.
 		 */
 		break;
 	}
@@ -536,7 +562,8 @@ static void vlin_setup(struct net_device *dev)
 	 */
 	lin_dev_init(dev, &vlin_lin_ops, sizeof(struct vlin_priv));
 	ld = lin_get_ml_priv(dev);
-	ld->caps = LIN_CAP_DIAG | LIN_CAP_CHK_ENH | LIN_CAP_WAKEUP;
+	ld->caps = LIN_CAP_DIAG | LIN_CAP_CHK_ENH | LIN_CAP_WAKEUP |
+		   LIN_CAP_SPORADIC;
 
 	vp = netdev_priv(dev);
 	vp->dev = dev;

@@ -72,6 +72,7 @@ TARGETS += net/af_unix
 TARGETS += net/can
 TARGETS += net/forwarding
 TARGETS += net/hsr
+TARGETS += net/lin
 TARGETS += net/mptcp
 TARGETS += net/netfilter
 TARGETS += net/openvswitch

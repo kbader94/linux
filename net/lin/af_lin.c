@@ -817,10 +817,16 @@ static __init int lin_init(void)
 	if (err)
 		goto out_notifier;
 
+	err = lin_link_ops_register();
+	if (err)
+		goto out_sock;
+
 	dev_add_pack(&lin_packet);
 
 	return 0;
 
+out_sock:
+	sock_unregister(PF_LIN);
 out_notifier:
 	unregister_netdevice_notifier(&lin_netdev_notifier);
 out_pernet:
@@ -833,6 +839,7 @@ out_cache:
 static __exit void lin_exit(void)
 {
 	dev_remove_pack(&lin_packet);
+	lin_link_ops_unregister();
 	sock_unregister(PF_LIN);
 	unregister_netdevice_notifier(&lin_netdev_notifier);
 	unregister_pernet_subsys(&lin_pernet_ops);

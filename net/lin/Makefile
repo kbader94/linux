@@ -4,7 +4,7 @@
 #
 
 obj-$(CONFIG_LIN)	+= lin.o
-lin-y			:= af_lin.o dev.o
+lin-y			:= af_lin.o dev.o netlink.o
 
 obj-$(CONFIG_LIN_RAW)	+= lin-raw.o
 lin-raw-y		:= raw.o

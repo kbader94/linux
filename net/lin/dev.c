@@ -21,6 +21,8 @@
 #include <linux/lin.h>
 #include <linux/lin/core.h>
 #include <linux/lin/dev.h>
+
+#include <net/rtnetlink.h>
 #include <net/sock.h>
 
 void lin_setup(struct net_device *dev)
@@ -101,6 +103,15 @@ struct net_device *alloc_lindev(int sizeof_priv,
 	dev = alloc_netdev(size, "lin%d", NET_NAME_UNKNOWN, lin_setup);
 	if (!dev)
 		return NULL;
+
+	/* Associate with the shared LIN rtnl_link_ops so hardware drivers
+	 * inherit IFLA_LIN_CAPS advertisement without writing their own
+	 * netlink ops. Drivers that register their own rtnl_link_ops
+	 * (vlin, for `ip link add type vlin`) get this pointer overwritten
+	 * by the rtnl core at link-creation time, which is the intended
+	 * SocketCAN-style precedence.
+	 */
+	dev->rtnl_link_ops = &lin_link_ops;
 
 	lin_dev_init(dev, ops, sizeof_priv);
 

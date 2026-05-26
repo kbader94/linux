@@ -719,6 +719,18 @@ static struct rtnl_link_ops vlin_link_ops __read_mostly = {
 	.priv_size	= ALIGN(sizeof(struct vlin_priv), NETDEV_ALIGN) +
 			  sizeof(struct lin_dev),
 	.setup		= vlin_setup,
+	/*
+	 * Advertise our LIN capabilities (LIN_CAP_*) and current bus
+	 * bit rate under IFLA_INFO_DATA via the core helpers, and route
+	 * IFLA_LIN_BITRATE writes through the shared changelink helper
+	 * (vlin does not implement set_bitrate, so the write returns
+	 * -EOPNOTSUPP with a clear netlink error message).
+	 */
+	.maxtype	= IFLA_LIN_MAX,
+	.policy		= lin_link_policy,
+	.get_size	= lin_link_get_size,
+	.fill_info	= lin_link_fill_info,
+	.changelink	= lin_link_changelink,
 };
 
 static __init int vlin_init(void)

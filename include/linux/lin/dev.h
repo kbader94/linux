@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/types.h>
+#include <net/netlink.h>
 #include <uapi/linux/lin/netlink.h>
 #include <uapi/linux/lin/raw.h>
 
@@ -28,8 +29,12 @@ struct sock;
 
 /*
  * Driver capability flags (LIN_CAP_*) are defined in
- * <uapi/linux/lin/netlink.h>; the rtnetlink integration that lands
- * later in the series exports them to userspace under IFLA_LIN_CAPS.
+ * <uapi/linux/lin/netlink.h> so the kernel and userspace share one set
+ * of values. Drivers populate struct lin_dev.caps with the union of
+ * features they implement before lin_register_netdev(); the core
+ * checks each user-facing feature against these flags and returns
+ * -EOPNOTSUPP for unsupported requests, and the bitmask is exported to
+ * userspace under IFLA_LIN_CAPS via lin_link_fill_info().
  */
 
 /*
@@ -323,6 +328,25 @@ struct lin_dev_ops {
 			   const u8 *data, u8 len, bool enhanced_checksum);
 
 	int (*wakeup_send)(struct lin_dev *ld);
+
+	/*
+	 * @set_bitrate: program the bus bit rate in bits per second.
+	 *
+	 * Invoked from the rtnetlink changelink path (IFLA_LIN_BITRATE)
+	 * under @policy_lock. The core updates the cached
+	 * @lin_dev.bitrate after a successful return; drivers should not
+	 * mutate that field directly outside of the pre-register
+	 * initialisation window.
+	 *
+	 * Return 0 on success, -EINVAL for a rate the hardware cannot
+	 * program (out of divider range, etc.), or another -errno the
+	 * driver propagates. Drivers that cannot change bus speed at
+	 * runtime leave this NULL; the netlink path returns -EOPNOTSUPP
+	 * in that case. Per-op timing budget: ten milliseconds (state-
+	 * update class; touches driver-internal config or a brief MMIO
+	 * sequence, not a wire-level wait).
+	 */
+	int (*set_bitrate)(struct lin_dev *ld, u32 bitrate);
 };
 
 /**
@@ -371,6 +395,15 @@ struct lin_dev_rcv_lists {
  * @caps:        LIN_CAP_* feature flags the driver supports; set by
  *               the driver before lin_register_netdev(), immutable
  *               after
+ * @bitrate:     current configured bus bit rate in bits per second,
+ *               or 0 if unknown / not yet configured. Drivers MAY
+ *               initialise this before lin_register_netdev() (sllin
+ *               seeds from the underlying TTY's termios baud, for
+ *               example); after register, the core writes it from
+ *               the rtnetlink IFLA_LIN_BITRATE path after a
+ *               successful @lin_dev_ops.set_bitrate call. Drivers
+ *               should treat it as read-only post-register. The
+ *               value is exported to userspace via IFLA_LIN_BITRATE.
  * @rcv_lists:   rx subscriber lists for this interface; see
  *               struct lin_dev_rcv_lists
  * @policy_lock: serialises mutation of cross-socket policy state on
@@ -423,6 +456,7 @@ struct lin_dev {
 	struct net_device		*dev;
 	const struct lin_dev_ops	*ops;
 	u32				 caps;
+	u32				 bitrate;
 	struct lin_dev_rcv_lists	 rcv_lists;
 	struct mutex			 policy_lock;
 	struct sock __rcu		*master_sk;
@@ -603,5 +637,43 @@ void lin_loopback_rx(struct net_device *dev, const struct lin_frame *frame,
  */
 struct sk_buff *alloc_lin_skb(struct net_device *dev,
 			      const struct lin_frame *frame);
+
+/*
+ * rtnl_link_ops helpers — advertise the LIN-specific attribute block
+ * (carried inside IFLA_INFO_DATA, defined in <uapi/linux/lin/netlink.h>)
+ * to userspace. Drivers point their rtnl_link_ops .get_size / .fill_info
+ * at these directly when they have no driver-specific attributes of
+ * their own, or call them from inside their own hooks after emitting
+ * driver-specific attributes. Every conforming LIN driver is expected
+ * to advertise its capabilities this way; userspace and the selftest
+ * suite read the result via RTM_GETLINK rather than feature-probing.
+ */
+size_t lin_link_get_size(const struct net_device *dev);
+int    lin_link_fill_info(struct sk_buff *skb, const struct net_device *dev);
+
+/*
+ * IFLA_LIN_* policy and changelink handler. Drivers that register their
+ * own rtnl_link_ops point .policy at lin_link_policy, .maxtype at
+ * IFLA_LIN_MAX, and .changelink at lin_link_changelink so writable
+ * attributes (today IFLA_LIN_BITRATE) flow through the same per-attr
+ * dispatch in the LIN core for every driver.
+ */
+extern const struct nla_policy lin_link_policy[];
+int lin_link_changelink(struct net_device *dev, struct nlattr *tb[],
+			struct nlattr *data[],
+			struct netlink_ext_ack *extack);
+
+/*
+ * Shared rtnl_link_ops registered once at LIN core module init.
+ * alloc_lindev() assigns it to each new lin_dev so that hardware drivers
+ * inherit IFLA_LIN_CAPS advertisement without needing their own
+ * rtnl_link_ops — the SocketCAN model (can_link_ops). Drivers that *do*
+ * register their own rtnl_link_ops (vlin's case, for
+ * `ip link add type vlin`) should plug .get_size = lin_link_get_size and
+ * .fill_info = lin_link_fill_info into their own ops.
+ */
+extern struct rtnl_link_ops lin_link_ops;
+int  lin_link_ops_register(void);
+void lin_link_ops_unregister(void);
 
 #endif /* _LIN_DEV_H */

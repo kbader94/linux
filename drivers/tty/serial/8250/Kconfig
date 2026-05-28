@@ -596,3 +596,20 @@ config SERIAL_OF_PLATFORM
 	  are probed through devicetree, including Open Firmware based
 	  PowerPC systems and embedded systems on architectures using the
 	  flattened device tree format.
+
+config SERIAL_8250_FIFO_PROBE
+	tristate "8250 FIFO probe"
+	depends on SERIAL_8250
+	depends on DEBUG_FS
+	depends on TTY
+	help
+	  Exposes a debugfs interface to probe FIFO sizes and trigger
+	  levels on 8250/16550-like UARTs by using internal loopback and direct register I/O.
+
+	  This is a developer/debug facility. It refuses to touch console ports
+	  and will fail if a TTY is open. Not recommended for production builds.
+
+	  Say M to build as a module, or Y to build-in.
+	  The debugfs directory will appear at:
+	    /sys/kernel/debug/uart_probe/
+

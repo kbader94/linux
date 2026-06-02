@@ -104,12 +104,18 @@ static void lin_raw_rcv(struct sk_buff *oskb, void *data)
 
 	/* LIN_RAW_RECV_OWN_MSGS gating against the loopback skb tags.
 	 * lin_loopback_rx() stamps master_owner and/or publisher_owner
-	 * at emission time so we can identify the originating socket(s)
+	 * at synth time so we can identify the originating socket(s)
 	 * here without racing against ld->master_sk / ld->publishers
 	 * mutations. Bus-sourced rx leaves both pointers NULL and
 	 * always passes the gate. Error frames are delivered
 	 * unconditionally — they carry diagnostic information the
 	 * originator should still see.
+	 *
+	 * LIN_RAW_LOOPBACK is enforced at emission time in
+	 * lin_loopback_rx() via the OR-vote across the emission's
+	 * tagged stakeholders; when every stakeholder has it off, the
+	 * skb isn't synthesised at all (mirrors SocketCAN's
+	 * can_send(skb, ro->loopback)).
 	 */
 	if (!ro->lin.recv_own_msgs) {
 		const struct lin_frame *lf =

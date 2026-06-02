@@ -24,20 +24,6 @@ struct lin_schedule;
 #define LIN_DNAME(dev) ((dev) ? (dev)->name : "any")
 
 /**
- * struct lin_proto - LIN protocol registration structure
- * @type:              socket type (e.g. SOCK_RAW for LIN_RAW)
- * @protocol:          LIN protocol identifier (LIN_RAW, ...)
- * @ops:      socket-level proto_ops for sock->ops
- * @prot:     struct proto template passed to sk_alloc()
- */
-struct lin_proto {
-	int			type;
-	int			protocol;
-	const struct proto_ops	*ops;
-	struct proto		*prot;
-};
-
-/**
  * struct lin_sock - common base for every PF_LIN per-socket state.
  * @sk:            kernel sock; must be first so container_of from
  *                 struct sock * works.
@@ -90,6 +76,20 @@ static inline bool lin_sk_recv_own_msgs(const struct sock *sk)
 {
 	return container_of(sk, struct lin_sock, sk)->recv_own_msgs;
 }
+
+/**
+ * struct lin_proto - LIN protocol registration structure
+ * @type:              socket type (e.g. SOCK_RAW for LIN_RAW)
+ * @protocol:          LIN protocol identifier (LIN_RAW, ...)
+ * @ops:      socket-level proto_ops for sock->ops
+ * @prot:     struct proto template passed to sk_alloc()
+ */
+struct lin_proto {
+	int			type;
+	int			protocol;
+	const struct proto_ops	*ops;
+	struct proto		*prot;
+};
 
 /* PF_LIN core API used by protocol modules (af_lin.c). */
 

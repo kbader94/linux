@@ -2,10 +2,13 @@
 #
 # Makefile for the LIN bus driver helpers (lin-dev).
 #
-# Holds skb-construction and owner-tagged loopback-synthesis code
-# every host-side LIN driver consumes - mirrors the role of
-# drivers/net/can/dev/can-dev.ko in the SocketCAN stack.
+# Holds protocol/state-machine code shared across every LIN driver that
+# drives the bus from the host: skb construction, owner-tagged loopback
+# synthesis, schedule engine, response cache, and (when
+# CONFIG_LIN_DEV_HELPERS_UART is selected) the UART byte-protocol layer
+# used by sllin and sdlin. Modeled on drivers/net/can/dev/.
 
-obj-$(CONFIG_LIN_DEV_HELPERS)	+= lin-dev.o
+obj-$(CONFIG_LIN_DEV_HELPERS)		+= lin-dev.o
 
-lin-dev-y			:= skb.o
+lin-dev-y				:= skb.o sched.o resp.o
+lin-dev-$(CONFIG_LIN_DEV_HELPERS_UART)	+= uart.o kthread.o

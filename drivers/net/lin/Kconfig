@@ -8,10 +8,20 @@ config LIN_DEV_HELPERS
 	depends on LIN
 	help
 	  Shared driver helpers (lin-dev.ko) for host-side LIN drivers:
-	  the device-side skb constructors and the owner-tagged loopback
-	  synthesiser. Auto-selected by every in-tree LIN driver that
-	  drives the bus from the host; users do not set this directly.
-	  Modelled on can-dev.
+	  the device-side skb constructors, the owner-tagged loopback
+	  synthesiser, the master schedule engine, and the response cache.
+	  Auto-selected by every in-tree LIN driver that drives the bus
+	  from the host; users do not set this directly. Modelled on
+	  can-dev.
+
+config LIN_DEV_HELPERS_UART
+	bool
+	depends on LIN_DEV_HELPERS
+	help
+	  UART byte-protocol layer of lin-dev. Adds the LIN-over-UART
+	  wire-format machinery (byte state machine, checksum, PID
+	  parity, break_ctl timing, RX parsers, FIFO Control probe)
+	  to lin-dev.ko. Auto-selected by sllin and sdlin.
 
 config LIN_VLIN
 	tristate "Virtual Local Interconnect Network interface (vlin)"

@@ -6,3 +6,4 @@
 obj-y			+= dev/
 
 obj-$(CONFIG_LIN_VLIN)	+= vlin.o
+obj-$(CONFIG_LIN_SLLIN)	+= sllin.o

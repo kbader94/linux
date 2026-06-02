@@ -45,3 +45,35 @@ config LIN_VLIN
 
 	  To compile this driver as a module, choose M here: the module will
 	  be called vlin.
+
+config LIN_SLLIN
+	tristate "Serial line LIN interface (sllin)"
+	depends on LIN && TTY
+	select LIN_DEV_HELPERS
+	select LIN_DEV_HELPERS_UART
+	help
+	  LIN bus on top of a serial line (UART) via a TTY line discipline.
+	  Attach the discipline to a /dev/ttyXX with ldattach (N_LIN, 31):
+
+	    ldattach 31 /dev/ttyS0
+
+	  This creates a sllinN interface on top of the underlying TTY,
+	  driving header/break/sync/PID generation and parsing responses
+	  byte-by-byte. A LIN-capable hardware UART is not required: any
+	  UART that supports 8N1 framing and either tty break_ctl or
+	  programmable non-standard baud rates works, which covers
+	  effectively every kernel UART driver.
+
+	  The driver implements the full LIN master role (unconditional,
+	  sporadic, diagnostic, and event-triggered schedule slots, plus
+	  bus wakeup) and acts as a publishing slave when no master is
+	  claimed on the link. Bit rate is configurable per-link via
+	  rtnetlink (IFLA_LIN_BITRATE) and seeded from the underlying
+	  TTY's termios baud at attach time.
+
+	  This is the spiritual successor to Pavel Pisa's out-of-tree
+	  sllin driver, rewritten against the in-tree PF_LIN socket
+	  family.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called sllin.

@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/lin/linux,sdlin.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Local Interconnect Network (LIN) bus over a UART (serdev)
+
+maintainers:
+  - Kyle Bader <kyle.bader94@gmail.com>
+
+description: |
+  Describes a LIN bus carried over a UART, attached via serdev at
+  driver-model probe time. This is the firmware-described counterpart
+  to the runtime ldattach-based sllin driver: where sllin is brought
+  up from userspace after boot, sdlin binds the UART for LIN before
+  userspace exists, which is required for embedded automotive ECUs
+  that must answer bus headers within hundreds of ms of power-on.
+
+  A given UART can be claimed either by a serdev driver (the path
+  used here) or by a TTY/userspace consumer, but not both. Choose
+  this binding when LIN bring-up timing precludes userspace attach.
+
+  Above the transport, sllin and sdlin share the same kernel
+  helpers, so feature support is identical: master role with
+  unconditional, sporadic, diagnostic, and event-triggered
+  schedule slots, slave-publisher role (subject to UART RX
+  latency, see LIN_CAP_PUB_SLAVE in
+  include/uapi/linux/lin/netlink.h), and bus wakeup.
+
+  Vendor-specific compatibles for particular LIN nodes attached
+  to a UART may chain through this driver by listing
+  "linux,sdlin" as a fallback compatible:
+
+      compatible = "acme,lin-rear-light", "linux,sdlin";
+
+  The driver matches on "linux,sdlin"; the vendor-specific
+  compatible documents what the node actually is.
+
+properties:
+  compatible:
+    const: linux,sdlin
+
+  bitrate:
+    description: |
+      LIN bus bit rate in bits per second. Must fall in the LIN
+      spec's [1000, 20000] range. When absent, the driver falls
+      back to the UART parent's "current-speed" property if
+      present, or to the LIN 1.x classic default of 19200 bps.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1000
+    maximum: 20000
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    serial {
+        current-speed = <19200>;
+
+        lin {
+            compatible = "linux,sdlin";
+            bitrate = <19200>;
+        };
+    };

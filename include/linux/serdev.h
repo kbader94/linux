@@ -11,6 +11,7 @@
 #include <linux/uaccess.h>
 #include <linux/termios.h>
 #include <linux/delay.h>
+#include <linux/serial_core.h>		/* for struct uart_fifo_control + enum uart_fifo_round */
 
 struct serdev_controller;
 struct serdev_device;
@@ -93,6 +94,11 @@ struct serdev_controller_ops {
 	int (*get_tiocm)(struct serdev_controller *);
 	int (*set_tiocm)(struct serdev_controller *, unsigned int, unsigned int);
 	int (*break_ctl)(struct serdev_controller *ctrl, unsigned int break_state);
+	int (*set_fifo_control)(struct serdev_controller *ctrl,
+				const struct uart_fifo_control *ctl,
+				enum uart_fifo_round round);
+	int (*get_fifo_control)(struct serdev_controller *ctrl,
+				struct uart_fifo_control *ctl);
 };
 
 /**
@@ -208,6 +214,11 @@ void serdev_device_wait_until_sent(struct serdev_device *, long);
 int serdev_device_get_tiocm(struct serdev_device *);
 int serdev_device_set_tiocm(struct serdev_device *, int, int);
 int serdev_device_break_ctl(struct serdev_device *serdev, int break_state);
+int serdev_device_set_fifo_control(struct serdev_device *serdev,
+				   const struct uart_fifo_control *ctl,
+				   enum uart_fifo_round round);
+int serdev_device_get_fifo_control(struct serdev_device *serdev,
+				   struct uart_fifo_control *ctl);
 void serdev_device_write_wakeup(struct serdev_device *);
 ssize_t serdev_device_write(struct serdev_device *, const u8 *, size_t, long);
 void serdev_device_write_flush(struct serdev_device *);
@@ -261,6 +272,17 @@ static inline int serdev_device_set_tiocm(struct serdev_device *serdev, int set,
 	return -EOPNOTSUPP;
 }
 static inline int serdev_device_break_ctl(struct serdev_device *serdev, int break_state)
+{
+	return -EOPNOTSUPP;
+}
+static inline int serdev_device_set_fifo_control(struct serdev_device *serdev,
+						 const struct uart_fifo_control *ctl,
+						 enum uart_fifo_round round)
+{
+	return -EOPNOTSUPP;
+}
+static inline int serdev_device_get_fifo_control(struct serdev_device *serdev,
+						 struct uart_fifo_control *ctl)
 {
 	return -EOPNOTSUPP;
 }

@@ -394,6 +394,57 @@ int serdev_device_break_ctl(struct serdev_device *serdev, int break_state)
 }
 EXPORT_SYMBOL_GPL(serdev_device_break_ctl);
 
+/**
+ * serdev_device_set_fifo_control() - program the underlying UART's FIFO.
+ * @serdev: serdev device.
+ * @ctl:    desired FIFO state (trigger thresholds, enable flag).
+ * @round:  policy for picking a supported trigger when the exact request
+ *          is not honourable; see &enum uart_fifo_round.
+ *
+ * Forwards to the controller's @set_fifo_control op when available. Used
+ * by serdev clients that need sub-frame RX-interrupt latency (e.g.
+ * LIN-over-serdev frontends configuring trigger = 1). Returns -EOPNOTSUPP
+ * when the controller cannot expose FIFO control (e.g. the underlying
+ * UART driver has not adopted the FIFO Control framework, or the
+ * transport is not UART-backed).
+ */
+int serdev_device_set_fifo_control(struct serdev_device *serdev,
+				   const struct uart_fifo_control *ctl,
+				   enum uart_fifo_round round)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->set_fifo_control)
+		return -EOPNOTSUPP;
+
+	return ctrl->ops->set_fifo_control(ctrl, ctl, round);
+}
+EXPORT_SYMBOL_GPL(serdev_device_set_fifo_control);
+
+/**
+ * serdev_device_get_fifo_control() - read back the UART's current FIFO state.
+ * @serdev: serdev device.
+ * @ctl:    out parameter; filled with the underlying UART's effective
+ *          FIFO configuration on success.
+ *
+ * Forwards to the controller's @get_fifo_control op when available.
+ * Clients typically call this after @serdev_device_set_fifo_control to
+ * verify that the requested trigger threshold was honoured (some UARTs
+ * round the request silently). Returns -EOPNOTSUPP when the controller
+ * cannot expose FIFO state.
+ */
+int serdev_device_get_fifo_control(struct serdev_device *serdev,
+				   struct uart_fifo_control *ctl)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->get_fifo_control)
+		return -EOPNOTSUPP;
+
+	return ctrl->ops->get_fifo_control(ctrl, ctl);
+}
+EXPORT_SYMBOL_GPL(serdev_device_get_fifo_control);
+
 static int serdev_drv_probe(struct device *dev)
 {
 	const struct serdev_device_driver *sdrv = to_serdev_device_driver(dev->driver);

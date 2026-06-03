@@ -248,6 +248,48 @@ static int ttyport_break_ctl(struct serdev_controller *ctrl, unsigned int break_
 	return tty->ops->break_ctl(tty, break_state);
 }
 
+/* Reach down through the TTY into the underlying uart_port. Only valid
+ * for UART-backed TTYs; non-UART TTYs do not expose driver_data as a
+ * uart_state, so we gate on tty->driver->type to avoid a misinterpreted
+ * pointer dereference.
+ */
+static struct uart_port *ttyport_uart_port(struct tty_struct *tty)
+{
+	struct uart_state *state;
+
+	if (!tty || !tty->driver || tty->driver->type != TTY_DRIVER_TYPE_SERIAL)
+		return NULL;
+	state = tty->driver_data;
+	if (!state)
+		return NULL;
+	return state->uart_port;
+}
+
+static int ttyport_set_fifo_control(struct serdev_controller *ctrl,
+				    const struct uart_fifo_control *fc,
+				    enum uart_fifo_round round)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+	struct uart_port *port = ttyport_uart_port(serport->tty);
+
+	if (!port)
+		return -EOPNOTSUPP;
+
+	return uart_set_fifo_control(port, fc, round);
+}
+
+static int ttyport_get_fifo_control(struct serdev_controller *ctrl,
+				    struct uart_fifo_control *fc)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+	struct uart_port *port = ttyport_uart_port(serport->tty);
+
+	if (!port)
+		return -EOPNOTSUPP;
+
+	return uart_get_fifo_control(port, fc);
+}
+
 static const struct serdev_controller_ops ctrl_ops = {
 	.write_buf = ttyport_write_buf,
 	.write_flush = ttyport_write_flush,
@@ -260,6 +302,8 @@ static const struct serdev_controller_ops ctrl_ops = {
 	.get_tiocm = ttyport_get_tiocm,
 	.set_tiocm = ttyport_set_tiocm,
 	.break_ctl = ttyport_break_ctl,
+	.set_fifo_control = ttyport_set_fifo_control,
+	.get_fifo_control = ttyport_get_fifo_control,
 };
 
 struct device *serdev_tty_port_register(struct tty_port *port,

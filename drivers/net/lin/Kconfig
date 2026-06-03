@@ -77,3 +77,38 @@ config LIN_SLLIN
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called sllin.
+
+config LIN_SDLIN
+	tristate "LIN over serdev (sdlin)"
+	depends on LIN && SERIAL_DEV_BUS
+	select LIN_DEV_HELPERS
+	select LIN_DEV_HELPERS_UART
+	help
+	  LIN bus on top of a UART that is described in firmware (Device
+	  Tree or ACPI) and bound at driver-model probe time via serdev.
+
+	  Use this instead of sllin when the LIN node must come up before
+	  userspace exists — embedded automotive ECUs that need to be
+	  answering bus headers within hundreds of ms of power-on cannot
+	  rely on the ldattach-from-userspace attach path that sllin
+	  requires.
+
+	  The two drivers are mutually exclusive per-port: a given UART
+	  is claimed either as a TTY (and is then available to sllin via
+	  ldattach) or as a serdev controller (and is then available to
+	  sdlin via firmware match). Above the transport, both share the
+	  same lin-dev helpers (schedule engine, response cache, UART
+	  byte protocol), so feature support and behaviour are identical.
+
+	  Example DT binding (UART speaking LIN to a downstream cluster):
+
+	    &uart3 {
+	        current-speed = <19200>;
+	        lin {
+	            compatible = "linux,sdlin";
+	            bitrate = <19200>;
+	        };
+	    };
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called sdlin.

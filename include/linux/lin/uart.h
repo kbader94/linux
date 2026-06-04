@@ -36,6 +36,7 @@
 
 #include <linux/hrtimer.h>
 #include <linux/spinlock_types.h>
+#include <linux/tty_flip.h>	/* tty_rx_token_t for io_ops->rx_token */
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/lin.h>		/* LIN_ID_MASK, LIN_MAX_DLEN, LIN_ID_NONE */
@@ -145,6 +146,28 @@ struct lin_uart_io_ops {
 	void (*flush_buffer)(struct lin_uart *u);
 	void (*tx_wakeup_arm)(struct lin_uart *u);
 	void (*tx_wakeup_disarm)(struct lin_uart *u);
+	/*
+	 * Direct-RX hooks (optional; both NULL on non-TTY transports such
+	 * as vlin and hardware LIN controllers that don't go through TTY
+	 * buffering).
+	 *
+	 * @drain_rx: invoked by the kthread on every wake; bypasses the
+	 *	     TTY workqueue's scheduling latency by pulling
+	 *	     committed RX bytes through the transport's
+	 *	     receive_buf path in the kthread's own context.
+	 * @rx_token: captures the current TTY direct-RX cursor for the
+	 *	     kthread to compare against on the next wait; the
+	 *	     wait predicate becomes true when this value differs
+	 *	     from the previously-captured token.
+	 *
+	 * See <linux/tty_flip.h> for the full direct-RX contract; the
+	 * frontend's open path is expected to call
+	 * tty_port_enable_direct_rx() (sllin) or
+	 * serdev_device_enable_direct_rx() (sdlin) before kthread_run,
+	 * and disable before kthread_stop.
+	 */
+	void (*drain_rx)(struct lin_uart *u);
+	tty_rx_token_t (*rx_token)(struct lin_uart *u);
 };
 
 /**

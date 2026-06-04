@@ -173,12 +173,22 @@ static bool run_slot_locked(struct lin_uart *u,
 /* Mainline kthread loop helpers                                       */
 /* ------------------------------------------------------------------ */
 
-/* Wait for either: a wakeable bit to assert, the next slot boundary
- * to pass, or kthread_stop. Returns true if the boundary deadline
- * elapsed and the engine should advance a slot, false if it was woken
- * for an rx/tx/error event (or shutdown) and should pump those first.
+/* Wait for either: a wakeable bit to assert, the TTY direct-RX cursor
+ * to advance past @rx_token, the next slot boundary to pass, or
+ * kthread_stop. Returns true if the boundary deadline elapsed and the
+ * engine should advance a slot, false if it was woken for an
+ * rx/tx/error event (or shutdown) and should pump those first.
+ *
+ * @rx_token is the consumer-side cursor captured before the previous
+ * drain; the wait predicate compares it against the producer cursor
+ * via u->io->rx_token, so a flip_buffer_push from the UART IRQ wakes
+ * the kthread out of wait_event even when none of the LIN_UART_F_* /
+ * LIN_SCHED_F_* bits have flipped yet. On transports that do not
+ * expose direct-RX (vlin, hardware controllers), @rx_token and
+ * u->io->rx_token are both meaningless — the predicate term is
+ * skipped via the NULL check.
  */
-static bool kthread_wait(struct lin_uart *u)
+static bool kthread_wait(struct lin_uart *u, tty_rx_token_t rx_token)
 {
 	ktime_t now = ktime_get();
 	ktime_t rem;
@@ -197,7 +207,8 @@ static bool kthread_wait(struct lin_uart *u)
 		test_bit(LIN_UART_F_TMOUTEVENT, &u->flags) ||
 		test_bit(LIN_UART_F_ERROR, &u->flags) ||
 		test_bit(LIN_SCHED_F_HDR_REQ, &u->sched->flags) ||
-		u->state == LIN_UART_ID_RECEIVED,
+		u->state == LIN_UART_ID_RECEIVED ||
+		(u->io->rx_token && u->io->rx_token(u) != rx_token),
 		rem);
 
 	if (test_bit(LIN_SCHED_F_RUNNING, &u->sched->flags) &&
@@ -567,6 +578,7 @@ static void kthread_step_state(struct lin_uart *u)
 int lin_sched_kthread_fn(void *data)
 {
 	struct lin_uart *u = data;
+	tty_rx_token_t rx_token;
 
 	sched_set_fifo(current);
 
@@ -575,12 +587,31 @@ int lin_sched_kthread_fn(void *data)
 	 * kthread entry beyond arming the slot deadline.
 	 */
 	u->sched->next_slot = ktime_get();
+	rx_token = u->io->rx_token ? u->io->rx_token(u) : 0;
 
 	while (!kthread_should_stop()) {
 		if (u->state == LIN_UART_IDLE)
 			kthread_try_fire(u);
 
-		kthread_wait(u);
+		kthread_wait(u, rx_token);
+
+		/* Direct-RX fast path: drain pending TTY flip-buffer bytes
+		 * in our own SCHED_FIFO context before the workqueue's
+		 * normal-priority kworker gets to. The drain calls
+		 * port->client_ops->receive_buf -> lin_uart_receive_buf,
+		 * which sets the LIN_UART_F_*EVENT bits processed below.
+		 * Refresh @rx_token after the drain so the next wait
+		 * predicate compares against the post-drain cursor; any
+		 * arrival between the drain and the next wait will then
+		 * make the predicate true immediately.
+		 *
+		 * No-op on transports without direct-RX (vlin etc.); the
+		 * workqueue path still delivers bytes in the slow case.
+		 */
+		if (u->io->drain_rx) {
+			u->io->drain_rx(u);
+			rx_token = u->io->rx_token(u);
+		}
 
 		if (test_and_clear_bit(LIN_UART_F_ERROR, &u->flags))
 			kthread_handle_error(u);

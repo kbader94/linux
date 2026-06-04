@@ -176,11 +176,28 @@ static void sdlin_io_flush_buffer(struct lin_uart *u)
 	serdev_device_write_flush(serdev);
 }
 
+/* See sllin_io_drain_rx() for the budget rationale. */
+static void sdlin_io_drain_rx(struct lin_uart *u)
+{
+	struct serdev_device *serdev = u->io_priv;
+
+	serdev_device_drain_buffer(serdev, 64);
+}
+
+static tty_rx_token_t sdlin_io_rx_token(struct lin_uart *u)
+{
+	struct serdev_device *serdev = u->io_priv;
+
+	return serdev_device_rx_token(serdev);
+}
+
 static const struct lin_uart_io_ops sdlin_io_ops = {
 	.write		= sdlin_io_write,
 	.break_ctl	= sdlin_io_break_ctl,
 	.set_baud	= sdlin_io_set_baud,
 	.flush_buffer	= sdlin_io_flush_buffer,
+	.drain_rx	= sdlin_io_drain_rx,
+	.rx_token	= sdlin_io_rx_token,
 	/* No tx_wakeup_arm / tx_wakeup_disarm: serdev_device_write_buf
 	 * returns the byte count it accepted, and the controller fires
 	 * write_wakeup unconditionally when room frees up. There is no
@@ -623,11 +640,18 @@ static int sdlin_probe(struct serdev_device *serdev)
 		goto err_close;
 	}
 
+	/* Opt in to direct-RX wakes so the kthread can drain in its own
+	 * SCHED_FIFO context. Must precede kthread_run so the kthread
+	 * sees a stable rx_token cursor on its very first iteration.
+	 */
+	serdev_device_enable_direct_rx(serdev);
+
 	sd->kwthread = kthread_run(lin_sched_kthread_fn, &sd->u,
 				   "sdlin/%s", dev->name);
 	if (IS_ERR(sd->kwthread)) {
 		err = PTR_ERR(sd->kwthread);
 		sd->kwthread = NULL;
+		serdev_device_disable_direct_rx(serdev);
 		lin_unregister_netdev(dev);
 		goto err_close;
 	}
@@ -653,6 +677,12 @@ static void sdlin_remove(struct serdev_device *serdev)
 	 * rationale.
 	 */
 	lin_unregister_netdev(sd->dev);
+
+	/* Stop the direct-RX wake stream before kthread_stop, symmetric
+	 * with probe-time enable. The kthread's wait predicate stays
+	 * valid via kthread_should_stop().
+	 */
+	serdev_device_disable_direct_rx(serdev);
 
 	if (sd->kwthread) {
 		kthread_stop(sd->kwthread);

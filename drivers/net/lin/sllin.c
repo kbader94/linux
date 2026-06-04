@@ -334,6 +334,28 @@ static void sllin_io_tx_wakeup_disarm(struct lin_uart *u)
 	clear_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
 }
 
+/* Drain the TTY flip buffer in the LIN kthread's SCHED_FIFO context.
+ * The budget caps the per-call work so the kthread cannot be made to
+ * spend unbounded time draining a backlog; it also bounds the
+ * worst-case cross-context wait on the buffer mutex against a
+ * concurrent workqueue drainer. A LIN frame fits in well under 64
+ * bytes, so 64 gives generous headroom for transient back-pressure
+ * without overshooting the slot deadline.
+ */
+static void sllin_io_drain_rx(struct lin_uart *u)
+{
+	struct tty_struct *tty = u->io_priv;
+
+	tty_port_drain_flip_buffer(tty->port, 64);
+}
+
+static tty_rx_token_t sllin_io_rx_token(struct lin_uart *u)
+{
+	struct tty_struct *tty = u->io_priv;
+
+	return tty_port_rx_token(tty->port);
+}
+
 static const struct lin_uart_io_ops sllin_io_ops = {
 	.write		= sllin_io_write,
 	.break_ctl	= sllin_io_break_ctl,
@@ -341,6 +363,8 @@ static const struct lin_uart_io_ops sllin_io_ops = {
 	.flush_buffer	= sllin_io_flush_buffer,
 	.tx_wakeup_arm	= sllin_io_tx_wakeup_arm,
 	.tx_wakeup_disarm = sllin_io_tx_wakeup_disarm,
+	.drain_rx	= sllin_io_drain_rx,
+	.rx_token	= sllin_io_rx_token,
 };
 
 /* ------------------------------------------------------------------ */
@@ -770,11 +794,18 @@ static int sllin_ldisc_open(struct tty_struct *tty)
 	if (err)
 		goto err_free;
 
+	/* Opt in to direct-RX wakes so the kthread can drain in its own
+	 * SCHED_FIFO context. Must precede kthread_run so the kthread
+	 * sees a stable rx_token cursor on its very first iteration.
+	 */
+	tty_port_enable_direct_rx(tty->port);
+
 	sl->kwthread = kthread_run(lin_sched_kthread_fn, &sl->u, "sllin/%s",
 				   dev->name);
 	if (IS_ERR(sl->kwthread)) {
 		err = PTR_ERR(sl->kwthread);
 		sl->kwthread = NULL;
+		tty_port_disable_direct_rx(tty->port);
 		lin_unregister_netdev(dev);
 		goto err_free;
 	}
@@ -828,6 +859,14 @@ static void sllin_ldisc_close(struct tty_struct *tty)
 	tty->disc_data = NULL;
 
 	lin_unregister_netdev(sl->dev);
+
+	/* Stop the direct-RX wake stream before kthread_stop. The
+	 * kthread's wait predicate stays valid (kthread_should_stop
+	 * trips first), but disabling here is the symmetric inverse of
+	 * the open-path enable and means no late wakes touch state the
+	 * kthread is in the process of releasing.
+	 */
+	tty_port_disable_direct_rx(tty->port);
 
 	if (sl->kwthread) {
 		kthread_stop(sl->kwthread);

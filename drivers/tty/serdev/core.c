@@ -445,6 +445,131 @@ int serdev_device_get_fifo_control(struct serdev_device *serdev,
 }
 EXPORT_SYMBOL_GPL(serdev_device_get_fifo_control);
 
+/**
+ * serdev_device_enable_direct_rx() - opt in to direct-RX wake notifications.
+ * @serdev: serdev device.
+ *
+ * After this call, every commit of new RX data on the underlying
+ * controller wakes the wait queue returned by
+ * serdev_device_rx_waitqueue() and advances the cursor read by
+ * serdev_device_rx_token(). The client is expected to wait on the
+ * wait queue and call serdev_device_drain_buffer() in its own
+ * scheduling context to bypass the workqueue's scheduling latency.
+ *
+ * The workqueue path is still scheduled in parallel and serves as the
+ * unconditional fallback. No-op on controllers that do not implement
+ * the direct-RX op (clients keep working via the workqueue path).
+ */
+void serdev_device_enable_direct_rx(struct serdev_device *serdev)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (ctrl && ctrl->ops->enable_direct_rx)
+		ctrl->ops->enable_direct_rx(ctrl);
+}
+EXPORT_SYMBOL_GPL(serdev_device_enable_direct_rx);
+
+/**
+ * serdev_device_disable_direct_rx() - opt back out of direct-RX wakes.
+ * @serdev: serdev device.
+ *
+ * Must be called before tearing down any state the consumer's wait
+ * predicate touches (e.g. before kthread_stop()). After this call,
+ * the underlying controller stops producing direct-RX wakes and
+ * advancing the cursor; subsequent serdev_device_rx_pending() always
+ * returns false against any prior token.
+ */
+void serdev_device_disable_direct_rx(struct serdev_device *serdev)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (ctrl && ctrl->ops->disable_direct_rx)
+		ctrl->ops->disable_direct_rx(ctrl);
+}
+EXPORT_SYMBOL_GPL(serdev_device_disable_direct_rx);
+
+/**
+ * serdev_device_drain_buffer() - drain committed RX bytes in caller's context.
+ * @serdev: serdev device.
+ * @budget: maximum bytes to forward this call.
+ *
+ * Forwards to the controller's drain_buffer op. Returns the byte
+ * count forwarded, or -EOPNOTSUPP when the controller does not
+ * expose direct-RX.
+ */
+int serdev_device_drain_buffer(struct serdev_device *serdev, size_t budget)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->drain_buffer)
+		return -EOPNOTSUPP;
+
+	return ctrl->ops->drain_buffer(ctrl, budget);
+}
+EXPORT_SYMBOL_GPL(serdev_device_drain_buffer);
+
+/**
+ * serdev_device_rx_waitqueue() - direct-RX wait queue for this device.
+ * @serdev: serdev device.
+ *
+ * Returns the per-controller wait queue the client should wait on
+ * with wait_event() (or NULL if direct-RX is unsupported, in which
+ * case the client falls back to the workqueue path).
+ */
+wait_queue_head_t *serdev_device_rx_waitqueue(struct serdev_device *serdev)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->rx_waitqueue)
+		return NULL;
+
+	return ctrl->ops->rx_waitqueue(ctrl);
+}
+EXPORT_SYMBOL_GPL(serdev_device_rx_waitqueue);
+
+/**
+ * serdev_device_rx_token() - capture the current producer cursor.
+ * @serdev: serdev device.
+ *
+ * Snapshot the producer cursor for later comparison with
+ * serdev_device_rx_pending(). Returns 0 on controllers that do not
+ * implement direct-RX; subsequent serdev_device_rx_pending() calls
+ * also return false in that case, so the token is harmless to pass
+ * through the wait predicate either way.
+ */
+tty_rx_token_t serdev_device_rx_token(struct serdev_device *serdev)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->rx_token)
+		return 0;
+
+	return ctrl->ops->rx_token(ctrl);
+}
+EXPORT_SYMBOL_GPL(serdev_device_rx_token);
+
+/**
+ * serdev_device_rx_pending() - has the cursor advanced since @since?
+ * @serdev: serdev device.
+ * @since:  a previously-captured token.
+ *
+ * The wait_event() predicate helper for the direct-RX path. Returns
+ * false on controllers that do not implement direct-RX (the consumer
+ * then waits purely on its other predicate terms and falls through to
+ * the workqueue path).
+ */
+bool serdev_device_rx_pending(struct serdev_device *serdev,
+			      tty_rx_token_t since)
+{
+	struct serdev_controller *ctrl = serdev->ctrl;
+
+	if (!ctrl || !ctrl->ops->rx_token)
+		return false;
+
+	return ctrl->ops->rx_token(ctrl) != since;
+}
+EXPORT_SYMBOL_GPL(serdev_device_rx_pending);
+
 static int serdev_drv_probe(struct device *dev)
 {
 	const struct serdev_device_driver *sdrv = to_serdev_device_driver(dev->driver);

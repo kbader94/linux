@@ -12,6 +12,8 @@
 #include <linux/termios.h>
 #include <linux/delay.h>
 #include <linux/serial_core.h>		/* for struct uart_fifo_control + enum uart_fifo_round */
+#include <linux/tty_flip.h>		/* for tty_rx_token_t and the direct-RX API */
+#include <linux/wait.h>			/* for wait_queue_head_t */
 
 struct serdev_controller;
 struct serdev_device;
@@ -99,6 +101,11 @@ struct serdev_controller_ops {
 				enum uart_fifo_round round);
 	int (*get_fifo_control)(struct serdev_controller *ctrl,
 				struct uart_fifo_control *ctl);
+	void (*enable_direct_rx)(struct serdev_controller *ctrl);
+	void (*disable_direct_rx)(struct serdev_controller *ctrl);
+	int  (*drain_buffer)(struct serdev_controller *ctrl, size_t budget);
+	wait_queue_head_t *(*rx_waitqueue)(struct serdev_controller *ctrl);
+	tty_rx_token_t (*rx_token)(struct serdev_controller *ctrl);
 };
 
 /**
@@ -219,6 +226,12 @@ int serdev_device_set_fifo_control(struct serdev_device *serdev,
 				   enum uart_fifo_round round);
 int serdev_device_get_fifo_control(struct serdev_device *serdev,
 				   struct uart_fifo_control *ctl);
+void serdev_device_enable_direct_rx(struct serdev_device *serdev);
+void serdev_device_disable_direct_rx(struct serdev_device *serdev);
+int  serdev_device_drain_buffer(struct serdev_device *serdev, size_t budget);
+wait_queue_head_t *serdev_device_rx_waitqueue(struct serdev_device *serdev);
+tty_rx_token_t serdev_device_rx_token(struct serdev_device *serdev);
+bool serdev_device_rx_pending(struct serdev_device *serdev, tty_rx_token_t since);
 void serdev_device_write_wakeup(struct serdev_device *);
 ssize_t serdev_device_write(struct serdev_device *, const u8 *, size_t, long);
 void serdev_device_write_flush(struct serdev_device *);
@@ -285,6 +298,26 @@ static inline int serdev_device_get_fifo_control(struct serdev_device *serdev,
 						 struct uart_fifo_control *ctl)
 {
 	return -EOPNOTSUPP;
+}
+static inline void serdev_device_enable_direct_rx(struct serdev_device *serdev) {}
+static inline void serdev_device_disable_direct_rx(struct serdev_device *serdev) {}
+static inline int serdev_device_drain_buffer(struct serdev_device *serdev,
+					     size_t budget)
+{
+	return -EOPNOTSUPP;
+}
+static inline wait_queue_head_t *serdev_device_rx_waitqueue(struct serdev_device *serdev)
+{
+	return NULL;
+}
+static inline tty_rx_token_t serdev_device_rx_token(struct serdev_device *serdev)
+{
+	return 0;
+}
+static inline bool serdev_device_rx_pending(struct serdev_device *serdev,
+					    tty_rx_token_t since)
+{
+	return false;
 }
 static inline ssize_t serdev_device_write(struct serdev_device *sdev,
 					  const u8 *buf, size_t count,

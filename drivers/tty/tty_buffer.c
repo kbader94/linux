@@ -449,27 +449,33 @@ receive_buf(struct tty_port *port, struct tty_buffer *head, size_t count)
 }
 
 /**
- * flush_to_ldisc		-	flush data from buffer to ldisc
- * @work: tty structure passed from work queue.
+ * tty_port_drain_flip_buffer - drain committed flip-buffer bytes to the
+ *				registered client in caller's context.
+ * @port:   tty port.
+ * @budget: maximum bytes to forward this call (SIZE_MAX to drain until
+ *          empty). Bounds per-call work for opt-in RT consumers.
  *
- * This routine is called out of the software interrupt to flush data from the
- * buffer chain to the line discipline.
+ * The single drain implementation used by both the normal flush
+ * workqueue and the opt-in direct-RX path. Takes the buffer lock,
+ * walks the buffer chain, forwards committed bytes via
+ * @port->client_ops->receive_buf(), and releases the lock. Process
+ * context only; the receive_buf hook may sleep. The buffer lock can
+ * see brief cross-context contention (one workqueue / direct-RX
+ * consumer pair) bounded by @budget on the other side.
  *
- * The receive_buf() method is single threaded for each tty instance.
- *
- * Locking: takes buffer lock to ensure single-threaded flip buffer 'consumer'.
+ * Returns the byte count forwarded.
  */
-static void flush_to_ldisc(struct work_struct *work)
+int tty_port_drain_flip_buffer(struct tty_port *port, size_t budget)
 {
-	struct tty_port *port = container_of(work, struct tty_port, buf.work);
 	struct tty_bufhead *buf = &port->buf;
+	size_t drained = 0;
 
 	mutex_lock(&buf->lock);
 
-	while (1) {
+	while (drained < budget) {
 		struct tty_buffer *head = buf->head;
 		struct tty_buffer *next;
-		size_t count, rcvd;
+		size_t count, rcvd, want;
 
 		/* Ldisc or user is trying to gain exclusive access */
 		if (atomic_read(&buf->priority))
@@ -492,8 +498,10 @@ static void flush_to_ldisc(struct work_struct *work)
 			continue;
 		}
 
-		rcvd = receive_buf(port, head, count);
+		want = min_t(size_t, count, budget - drained);
+		rcvd = receive_buf(port, head, want);
 		head->read += rcvd;
+		drained += rcvd;
 		if (rcvd < count)
 			lookahead_bufs(port, head);
 		if (!rcvd)
@@ -503,7 +511,21 @@ static void flush_to_ldisc(struct work_struct *work)
 	}
 
 	mutex_unlock(&buf->lock);
+	return drained;
+}
+EXPORT_SYMBOL_GPL(tty_port_drain_flip_buffer);
 
+/*
+ * flush_to_ldisc - flush data from buffer to ldisc.
+ *
+ * Workqueue entry point. Thin wrapper around
+ * tty_port_drain_flip_buffer() with an unbounded budget.
+ */
+static void flush_to_ldisc(struct work_struct *work)
+{
+	struct tty_port *port = container_of(work, struct tty_port, buf.work);
+
+	tty_port_drain_flip_buffer(port, SIZE_MAX);
 }
 
 static inline void tty_flip_buffer_commit(struct tty_buffer *tail)
@@ -530,9 +552,60 @@ void tty_flip_buffer_push(struct tty_port *port)
 	struct tty_bufhead *buf = &port->buf;
 
 	tty_flip_buffer_commit(buf->tail);
+
+	/* Direct-RX fast path: if an opt-in consumer is registered, bump
+	 * the producer cursor and wake it so it can drain in its own
+	 * scheduling context. Both READ_ONCE and atomic_long_inc are
+	 * lock-free and IRQ-context safe; wake_up on an empty wait queue
+	 * is a no-op. The cursor increment must happen before the wake
+	 * so the consumer's predicate (tty_port_rx_pending()) observes
+	 * the new value when wait_event re-evaluates after wake.
+	 */
+	if (READ_ONCE(buf->reader_enabled)) {
+		atomic_long_inc(&buf->reader_seq);
+		wake_up(&buf->reader_wait);
+	}
+
 	queue_work(system_dfl_wq, &buf->work);
 }
 EXPORT_SYMBOL(tty_flip_buffer_push);
+
+void tty_port_enable_direct_rx(struct tty_port *port)
+{
+	WRITE_ONCE(port->buf.reader_enabled, true);
+}
+EXPORT_SYMBOL_GPL(tty_port_enable_direct_rx);
+
+void tty_port_disable_direct_rx(struct tty_port *port)
+{
+	WRITE_ONCE(port->buf.reader_enabled, false);
+	/* Release any waiter currently parked on reader_wait so it can
+	 * observe the disable and exit its wait loop. The waiter's
+	 * outer predicate (typically kthread_should_stop() or similar)
+	 * is what actually terminates it; we just unblock the
+	 * wait_event so it can re-check.
+	 */
+	wake_up_all(&port->buf.reader_wait);
+}
+EXPORT_SYMBOL_GPL(tty_port_disable_direct_rx);
+
+tty_rx_token_t tty_port_rx_token(struct tty_port *port)
+{
+	return (tty_rx_token_t)atomic_long_read(&port->buf.reader_seq);
+}
+EXPORT_SYMBOL_GPL(tty_port_rx_token);
+
+bool tty_port_rx_pending(struct tty_port *port, tty_rx_token_t since)
+{
+	return (tty_rx_token_t)atomic_long_read(&port->buf.reader_seq) != since;
+}
+EXPORT_SYMBOL_GPL(tty_port_rx_pending);
+
+wait_queue_head_t *tty_port_rx_waitqueue(struct tty_port *port)
+{
+	return &port->buf.reader_wait;
+}
+EXPORT_SYMBOL_GPL(tty_port_rx_waitqueue);
 
 /**
  * tty_insert_flip_string_and_push_buffer - add characters to the tty buffer and
@@ -585,6 +658,9 @@ void tty_buffer_init(struct tty_port *port)
 	atomic_set(&buf->priority, 0);
 	INIT_WORK(&buf->work, flush_to_ldisc);
 	buf->mem_limit = TTYB_DEFAULT_MEM_LIMIT;
+	init_waitqueue_head(&buf->reader_wait);
+	atomic_long_set(&buf->reader_seq, 0);
+	buf->reader_enabled = false;
 }
 
 /**

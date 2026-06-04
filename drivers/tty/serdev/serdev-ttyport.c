@@ -290,6 +290,41 @@ static int ttyport_get_fifo_control(struct serdev_controller *ctrl,
 	return uart_get_fifo_control(port, fc);
 }
 
+static void ttyport_enable_direct_rx(struct serdev_controller *ctrl)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+
+	tty_port_enable_direct_rx(serport->port);
+}
+
+static void ttyport_disable_direct_rx(struct serdev_controller *ctrl)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+
+	tty_port_disable_direct_rx(serport->port);
+}
+
+static int ttyport_drain_buffer(struct serdev_controller *ctrl, size_t budget)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+
+	return tty_port_drain_flip_buffer(serport->port, budget);
+}
+
+static wait_queue_head_t *ttyport_rx_waitqueue(struct serdev_controller *ctrl)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+
+	return tty_port_rx_waitqueue(serport->port);
+}
+
+static tty_rx_token_t ttyport_rx_token(struct serdev_controller *ctrl)
+{
+	struct serport *serport = serdev_controller_get_drvdata(ctrl);
+
+	return tty_port_rx_token(serport->port);
+}
+
 static const struct serdev_controller_ops ctrl_ops = {
 	.write_buf = ttyport_write_buf,
 	.write_flush = ttyport_write_flush,
@@ -304,6 +339,11 @@ static const struct serdev_controller_ops ctrl_ops = {
 	.break_ctl = ttyport_break_ctl,
 	.set_fifo_control = ttyport_set_fifo_control,
 	.get_fifo_control = ttyport_get_fifo_control,
+	.enable_direct_rx = ttyport_enable_direct_rx,
+	.disable_direct_rx = ttyport_disable_direct_rx,
+	.drain_buffer = ttyport_drain_buffer,
+	.rx_waitqueue = ttyport_rx_waitqueue,
+	.rx_token = ttyport_rx_token,
 };
 
 struct device *serdev_tty_port_register(struct tty_port *port,

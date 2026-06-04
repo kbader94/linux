@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/llist.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 struct tty_buffer {
@@ -42,6 +43,35 @@ struct tty_bufhead {
 	atomic_t	   mem_used;    /* In-use buffers excluding free list */
 	int		   mem_limit;
 	struct tty_buffer *tail;	/* Active buffer */
+
+	/* Opt-in early-RX notification for non-terminal consumers.
+	 *
+	 * Enabled by tty_port_enable_direct_rx(); when set, every
+	 * tty_flip_buffer_push() increments @reader_seq and wakes
+	 * @reader_wait in addition to scheduling the normal flip
+	 * workqueue. A registered consumer (a kthread, an RT userspace
+	 * reader, ...) waits on @reader_wait and drains the flip buffer
+	 * via tty_port_drain_flip_buffer() in its own scheduling context,
+	 * skipping the workqueue's scheduling latency on the fast path.
+	 *
+	 * @reader_seq is the producer-side cursor: the consumer saves a
+	 * snapshot before waiting (tty_port_rx_token()), and the wait
+	 * predicate compares the snapshot against the current value
+	 * (tty_port_rx_pending()) — this makes the wake a state change
+	 * the predicate can observe, not just a pulse.
+	 *
+	 * @reader_wait, @reader_seq, and @reader_enabled have the same
+	 * lifetime as the tty_port (they are embedded here, not stored as
+	 * external pointers), so an IRQ-context wake_up cannot UAF
+	 * against a process-context teardown.
+	 *
+	 * The workqueue path remains unconditional — direct-RX is an
+	 * optimisation, not a replacement: a slow or absent consumer
+	 * still gets bytes delivered via the regular flush_to_ldisc.
+	 */
+	wait_queue_head_t  reader_wait;
+	atomic_long_t	   reader_seq;
+	bool		   reader_enabled;
 };
 
 /*
